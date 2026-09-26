@@ -343,6 +343,28 @@ describe('foreground fallback redo: host retry budget', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(3);
   });
 
+  test('S1: success on the fallback restores the full host retry budget', async () => {
+    const sid = 'success-rearms-budget';
+    const { manager, mocks } = makeManager({ maxRetries: 2 });
+    await manager.handleEvent(redoEvents.assistant(sid));
+    for (let attempt = 1; attempt <= 3; attempt++)
+      await manager.handleEvent(redoEvents.retry(sid, attempt));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+    jest.setSystemTime(1_006_000);
+    await manager.handleEvent(redoEvents.success(sid, 'b'));
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await manager.handleEvent(redoEvents.retry(sid, attempt));
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    }
+    await manager.handleEvent(redoEvents.retry(sid, 3));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'c' } },
+    });
+    expect(mocks.abort).toHaveBeenCalledTimes(2);
+  });
+
   test('T5: after stage 2 a non-primary new turn cannot abort again', async () => {
     const sid = 'exhausted-non-primary';
     const { manager, mocks } = makeManager({
