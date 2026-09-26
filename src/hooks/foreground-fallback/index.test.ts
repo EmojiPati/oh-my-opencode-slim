@@ -10,6 +10,7 @@ import {
 } from 'bun:test';
 import { isInternalInitiatorPart } from '../../utils';
 import * as logger from '../../utils/logger';
+import { mapV2EventToV1 } from '../../v2/event-adapter';
 import { SessionLifecycle } from '../session-lifecycle';
 import { ForegroundFallbackManager, isFailoverError } from './index';
 
@@ -118,7 +119,7 @@ const retryMgr = (
     { orchestrator: ids.map((id) => `test/${id}`) },
     true,
     { directory: '/test' } as any,
-    3,
+    0, // Existing hook-switch tests isolate switching from host retry budgets.
     undefined,
     onChanged,
   );
@@ -363,6 +364,110 @@ describe('foreground fallback redo: host retry budget', () => {
     await manager.handleEvent(redoEvents.retry(sid));
     expect(mocks.abort).toHaveBeenCalledTimes(1);
     expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+  });
+
+  test.each([
+    { retry: true, maxRetries: 0 },
+    { retry: true, maxRetries: 2 },
+    { retry: false, maxRetries: 0 },
+    { retry: false, maxRetries: 2 },
+  ])(
+    'T6: v2 host decision retry=$retry with budget $maxRetries',
+    async ({ retry, maxRetries }) => {
+      const sid = `v2-${retry}-${maxRetries}`;
+      const { manager, mocks } = makeManager({ maxRetries });
+      const switchModel = mock(async () => {});
+      const decision = { retry, delay: 77 };
+      const first = retryEvent(sid, 'a', decision);
+      if (retry) {
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+          await manager.handleV2Retry(
+            retryEvent(sid, 'a', decision),
+            switchModel,
+          );
+          expect(switchModel).not.toHaveBeenCalled();
+          expect(decision).toEqual({ retry: true, delay: 77 });
+        }
+      }
+      await manager.handleV2Retry(first, switchModel);
+      expect(switchModel).toHaveBeenCalledWith(sid, {
+        providerID: 'test',
+        id: 'b',
+      });
+      expect(first.decision).toEqual({ retry: true, delay: 0 });
+
+      const next = retryEvent(sid, 'b', { retry: true, delay: 77 });
+      await manager.handleV2Retry(next, switchModel);
+      if (retry || maxRetries === 0) {
+        expect(switchModel).toHaveBeenCalledTimes(2);
+        expect(switchModel).toHaveBeenLastCalledWith(sid, {
+          providerID: 'test',
+          id: 'c',
+        });
+      } else {
+        expect(switchModel).toHaveBeenCalledTimes(1);
+        expect(next.decision).toEqual({ retry: true, delay: 77 });
+      }
+      expect(mocks.abort).not.toHaveBeenCalled();
+      expect(mocks.promptAsync).not.toHaveBeenCalled();
+    },
+  );
+
+  test('T6: v2 primary re-emission after exhaustion earns a fresh budget', async () => {
+    const sid = 'v2-fresh-descent';
+    const { manager } = makeManager({
+      chain: ['test/a', 'test/b'],
+      maxRetries: 2,
+    });
+    const switchModel = mock(async () => {});
+    for (let attempt = 0; attempt < 2; attempt++)
+      await manager.handleV2Retry(
+        retryEvent(sid, 'a', { retry: true }),
+        switchModel,
+      );
+    expect(switchModel).not.toHaveBeenCalled();
+    for (const id of ['a', 'b'])
+      await manager.handleV2Retry(
+        retryEvent(sid, id, { retry: false }),
+        switchModel,
+      );
+    const exhausted = retryEvent(sid, 'b', { retry: false });
+    await manager.handleV2Retry(exhausted, switchModel);
+    expect(exhausted.decision).toEqual({ retry: false });
+    expect(switchModel).toHaveBeenCalledTimes(2);
+
+    await manager.handleEvent(redoEvents.assistant(sid, 'a'));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const host = retryEvent(sid, 'a', { retry: true, delay: 77 });
+      await manager.handleV2Retry(host, switchModel);
+      expect(host.decision).toEqual({ retry: true, delay: 77 });
+      expect(switchModel).toHaveBeenCalledTimes(2);
+    }
+    await manager.handleV2Retry(
+      retryEvent(sid, 'a', { retry: true }),
+      switchModel,
+    );
+    expect(switchModel).toHaveBeenCalledTimes(3);
+  });
+
+  test('T7: mapped v2 failed execution prompts once without charging host retries', async () => {
+    const sid = 'v2-failed-execution';
+    const { manager, mocks } = makeManager({ maxRetries: 2 });
+    await manager.handleEvent(redoEvents.assistant(sid));
+    for (const mapped of mapV2EventToV1({
+      type: 'session.execution.failed',
+      data: { sessionID: sid, error: { message: 'rate limit' } },
+    }))
+      await manager.handleEvent(mapped);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+    const switchModel = mock(async () => {});
+    const host = retryEvent(sid, 'b', { retry: true, delay: 77 });
+    await manager.handleV2Retry(host, switchModel);
+    expect(switchModel).not.toHaveBeenCalled();
+    expect(host.decision).toEqual({ retry: true, delay: 77 });
   });
 });
 

@@ -812,6 +812,10 @@ export class ForegroundFallbackManager {
         return;
       if (event.agent) this.registerSessionAgent(sessionID, event.agent);
       this.sessionModel.set(sessionID, from);
+      if (event.decision?.retry === true) {
+        this.rearmIfFreshDescent(sessionID);
+        if (this.absorbHostRetry(sessionID)) return;
+      }
       const selected = this.selectFallbackModel(sessionID);
       if (!selected || selected === 'exhausted') return;
       const { agentName, nextModel, ref } = selected;
