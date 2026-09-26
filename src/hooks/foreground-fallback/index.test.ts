@@ -341,6 +341,29 @@ describe('foreground fallback redo: host retry budget', () => {
     expect(mocks.abort).toHaveBeenCalledTimes(3);
     expect(mocks.promptAsync).toHaveBeenCalledTimes(3);
   });
+
+  test('T5: after stage 2 a non-primary new turn cannot abort again', async () => {
+    const sid = 'exhausted-non-primary';
+    const { manager, mocks } = makeManager({
+      chain: ['test/a', 'test/b'],
+      maxRetries: 0,
+    });
+    await manager.handleEvent(redoEvents.assistant(sid));
+    await manager.handleEvent(redoEvents.error(sid));
+    await manager.handleEvent(redoEvents.assistant(sid, 'b'));
+    jest.setSystemTime(1_006_000);
+    await manager.handleEvent(redoEvents.error(sid));
+    jest.setSystemTime(1_012_000);
+    await manager.handleEvent(redoEvents.error(sid));
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+
+    jest.setSystemTime(1_018_000);
+    await manager.handleEvent(redoEvents.assistant(sid, 'b'));
+    await manager.handleEvent(redoEvents.retry(sid));
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('ForegroundFallbackManager v2 retry hook', () => {

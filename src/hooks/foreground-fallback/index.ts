@@ -1051,6 +1051,8 @@ export class ForegroundFallbackManager {
     if (this.abandonedByDispose(sessionID)) return;
     if (this.inProgress.has(sessionID)) return;
     if (!this.hasFallbackChain(sessionID)) return;
+    // An exhausted chain has no replacement: never abort another host retry.
+    if (this.chainExhaustion.get(sessionID) === 2) return;
     if (this.withholdsAbortForLiveChildren(sessionID)) return;
     if (this.isDeduped(sessionID)) return;
 
