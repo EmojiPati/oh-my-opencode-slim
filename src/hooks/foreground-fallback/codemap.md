@@ -17,6 +17,8 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   - `sessionModel`: Maps sessionID → current model string ("providerID/modelID")
   - `sessionAgent`: Maps sessionID → agent name
   - `sessionTried`: Maps sessionID → Set of models already attempted
+  - `sessionRetries`: Maps sessionID → absorbed host retry count for the entire descent (not per model)
+  - `chainExhaustion`: Maps sessionID → exhaustion stage; stage 2 prevents further aborts without a fresh descent
   - `inProgress`: Process-global Set of sessions with active fallback in flight, shared via `globalThis` + `Symbol.for`
   - `lastTrigger`: Maps sessionID → timestamp for deduplication
 
@@ -34,6 +36,7 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   - `message.updated`: Error in message metadata
   - `session.error`: Session-level error event
   - `session.status`: Status message containing rate-limit indicators
+- **Retry budget**: Only a failover-worthy host `session.status` retry (or a v2 retry hook with `decision.retry === true`) charges `fallback.maxRetries`. Terminal `session.error` and errored `message.updated` advance immediately. Exhausting the retry budget keeps it charged across the model chain; successful assistant completion, observed fresh descent from the configured primary, or deletion re-arms it. Stage-2 exhaustion blocks abort on subsequent retry statuses until a fresh descent.
 
 ### State Management
 - **Deduplication window**: 5-second cooldown (`DEDUP_WINDOW_MS`) to prevent multiple triggers for same rate-limit event
@@ -110,6 +113,7 @@ Fallback chains are provided as `Record<string, string[]>` where:
 
 ## Error Handling
 - **Graceful degradation**: Best-effort approach; abort may be slow or incomplete
+- **Unverified v2 host detail**: It is not established whether OpenCode 2.0.18 emits `session.usage.updated` or `session.step.ended` on failed attempts. The existing adapter maps these events to successful completed-assistant messages; if they occur on failure, they can re-arm the budget prematurely. No v2 usage filter is applied without host evidence.
 - **Validation**: Checks for `promptAsync` availability before attempting re-prompt
 - **Fallback exhaustion**: Logs when entire chain has been attempted without success
 - **Invalid model format**: Skips malformed model references

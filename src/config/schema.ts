@@ -658,9 +658,10 @@ export const FailoverConfigSchema = z.preprocess(
         .min(0)
         .default(3)
         .describe(
-          'Number of consecutive 429/rate-limit responses tolerated on the ' +
-            'same model before aborting (or swapping to the next fallback ' +
-            'model when a chain is configured).',
+          'Host retry events absorbed before foreground fallback (0 = switch ' +
+            'on the first retry event). The budget stays spent across model ' +
+            'switches, re-arms on success, fresh primary descent, or session ' +
+            'deletion; terminal errors advance immediately without charging it.',
         ),
       initialRetryDelayMs: z
         .number()
