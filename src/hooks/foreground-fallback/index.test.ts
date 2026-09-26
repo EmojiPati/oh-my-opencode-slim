@@ -1,4 +1,5 @@
 import {
+  afterEach,
   beforeEach,
   describe,
   expect,
@@ -132,6 +133,104 @@ const retryEvent = (
   model: { providerID: 'test', id },
   error: { message: 'rate limit' },
   decision,
+});
+
+// Host order: the assistant is announced before its error surfaces through
+// session.error and message.updated. The transcript already contains the
+// user's message and its parts when fallback requests a replay.
+const redoEvents = {
+  assistant: (sessionID: string, modelID = 'a', error?: unknown) => ({
+    type: 'message.updated',
+    properties: {
+      info: {
+        id: `assistant-${sessionID}`,
+        sessionID,
+        role: 'assistant',
+        agent: 'orchestrator',
+        providerID: 'test',
+        modelID,
+        ...(error === undefined ? {} : { error }),
+      },
+    },
+  }),
+  error: (sessionID: string, error: unknown = { message: 'rate limit' }) => ({
+    type: 'session.error',
+    properties: { sessionID, error },
+  }),
+  retry: (sessionID: string, attempt = 1) => ({
+    type: 'session.status',
+    properties: {
+      sessionID,
+      status: { type: 'retry', attempt, message: 'rate limit' },
+    },
+  }),
+  success: (sessionID: string, modelID = 'a') => ({
+    type: 'message.updated',
+    properties: {
+      info: {
+        sessionID,
+        role: 'assistant',
+        agent: 'orchestrator',
+        providerID: 'test',
+        modelID,
+        time: { completed: 1 },
+      },
+    },
+  }),
+};
+
+function makeManager({
+  chain = ['test/a', 'test/b', 'test/c'],
+  maxRetries = 3,
+  onChanged,
+}: {
+  chain?: string[];
+  maxRetries?: number;
+  onChanged?: (sessionID: string, model: string) => void;
+} = {}) {
+  const { mocks } = createMockClient({
+    messagesData: [
+      {
+        info: { id: 'user-message', role: 'user' },
+        parts: [{ type: 'text', text: 'hello' }],
+      },
+    ],
+  });
+  return {
+    manager: new ForegroundFallbackManager(
+      { orchestrator: chain },
+      true,
+      { directory: '/test' } as never,
+      maxRetries,
+      undefined,
+      onChanged,
+      0,
+      0,
+    ),
+    mocks,
+  };
+}
+
+describe('foreground fallback redo harness', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(1_000_000);
+  });
+  afterEach(() => jest.useRealTimers());
+
+  test('host-ordered error replay selects the next model', async () => {
+    const { manager, mocks } = makeManager();
+    await manager.handleEvent(redoEvents.assistant('harness'));
+    await manager.handleEvent(redoEvents.error('harness'));
+    await manager.handleEvent(
+      redoEvents.assistant('harness', 'a', { message: 'rate limit' }),
+    );
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+    expect(mocks.abort).not.toHaveBeenCalled();
+  });
 });
 
 describe('ForegroundFallbackManager v2 retry hook', () => {
