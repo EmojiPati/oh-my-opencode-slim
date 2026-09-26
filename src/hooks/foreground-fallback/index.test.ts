@@ -233,6 +233,116 @@ describe('foreground fallback redo harness', () => {
   });
 });
 
+describe('foreground fallback redo: host retry budget', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(1_000_000);
+  });
+  afterEach(() => jest.useRealTimers());
+
+  test.each([0, 1, 3])(
+    'T1: %i host retries are absorbed before the first switch, not renewed by the switch',
+    async (maxRetries) => {
+      const sid = `budget-${maxRetries}`;
+      const { manager, mocks } = makeManager({ maxRetries });
+      await manager.handleEvent(redoEvents.assistant(sid));
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        await manager.handleEvent(redoEvents.retry(sid, attempt));
+        expect(mocks.abort).not.toHaveBeenCalled();
+        expect(mocks.promptAsync).not.toHaveBeenCalled();
+      }
+      await manager.handleEvent(redoEvents.retry(sid, maxRetries + 1));
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+        body: { model: { providerID: 'test', modelID: 'b' } },
+      });
+      await manager.handleEvent(redoEvents.assistant(sid, 'b'));
+      await manager.handleEvent(redoEvents.retry(sid, 1));
+      expect(mocks.abort).toHaveBeenCalledTimes(2);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+      expect(mocks.promptAsync.mock.calls[1]?.[0]).toMatchObject({
+        body: { model: { providerID: 'test', modelID: 'c' } },
+      });
+    },
+  );
+
+  test.each([
+    ['401', { data: { statusCode: 401 } }],
+    ['410', { data: { statusCode: 410 } }],
+    ['not-found', { message: 'Model not found: test/a' }],
+    ['policy', { data: { responseBody: '{"code":"cyber_policy"}' } }],
+    ['429', { data: { statusCode: 429 } }],
+  ])(
+    'T2: terminal %s advances immediately via both error event paths',
+    async (_label, error) => {
+      for (const source of ['session.error', 'message.updated'] as const) {
+        const sid = `terminal-${_label}-${source}`;
+        const { manager, mocks } = makeManager();
+        await manager.handleEvent(redoEvents.assistant(sid));
+        const fail = () =>
+          source === 'session.error'
+            ? redoEvents.error(sid, error)
+            : redoEvents.assistant(sid, 'a', error);
+        await manager.handleEvent(fail());
+        // The host re-emits the failed assistant after session.error. Its
+        // model identifies the original incident even after the replay switch.
+        await manager.handleEvent(redoEvents.assistant(sid, 'a', error));
+        expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+        expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+          body: { model: { providerID: 'test', modelID: 'b' } },
+        });
+        expect(mocks.abort).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  test('T3: serial and concurrent observations of one failure replay only once', async () => {
+    const sid = 'duplicate-observation';
+    const { manager, mocks } = makeManager();
+    await manager.handleEvent(redoEvents.assistant(sid));
+    await Promise.all([
+      manager.handleEvent(redoEvents.error(sid)),
+      manager.handleEvent(
+        redoEvents.assistant(sid, 'a', { message: 'rate limit' }),
+      ),
+    ]);
+    await manager.handleEvent(
+      redoEvents.assistant(sid, 'a', { message: 'rate limit' }),
+    );
+    await manager.handleEvent(redoEvents.error(sid));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('T4: fresh primary descent re-arms the full budget after stage 2', async () => {
+    const sid = 'fresh-descent';
+    const { manager, mocks } = makeManager({
+      chain: ['test/a', 'test/b'],
+      maxRetries: 2,
+    });
+    await manager.handleEvent(redoEvents.assistant(sid));
+    for (let attempt = 1; attempt <= 3; attempt++)
+      await manager.handleEvent(redoEvents.retry(sid, attempt));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    await manager.handleEvent(redoEvents.assistant(sid, 'b'));
+    await manager.handleEvent(redoEvents.error(sid));
+    jest.setSystemTime(1_006_000);
+    await manager.handleEvent(redoEvents.error(sid));
+    expect(mocks.abort).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+
+    jest.setSystemTime(1_012_000);
+    await manager.handleEvent(redoEvents.assistant(sid));
+    await manager.handleEvent(redoEvents.retry(sid, 1));
+    await manager.handleEvent(redoEvents.retry(sid, 2));
+    expect(mocks.abort).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    await manager.handleEvent(redoEvents.retry(sid, 3));
+    expect(mocks.abort).toHaveBeenCalledTimes(3);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(3);
+  });
+});
+
 describe('ForegroundFallbackManager v2 retry hook', () => {
   test.each([{ retry: true, delay: 2000 }, { retry: false }])(
     'switches in place without abort or re-prompt (initial decision %p)',
@@ -2048,7 +2158,7 @@ describe('ForegroundFallbackManager v1 abort protection for live children', () =
       chain,
       true,
       { directory: '/test', hostFlavor } as any,
-      3,
+      0, // Exercise abort/handoff guards on the first host retry.
       undefined,
       undefined,
       0,
@@ -2322,7 +2432,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2374,7 +2484,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2436,7 +2546,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2478,7 +2588,7 @@ describe('ForegroundFallbackManager session.status', () => {
       },
     });
     const input = { directory: '/test' } as any;
-    const mgr = new ForegroundFallbackManager(makeChains(), true, input, 3);
+    const mgr = new ForegroundFallbackManager(makeChains(), true, input, 0);
     mgr.registerSessionAgent(sessionID, 'orchestrator');
     await mgr.handleEvent({
       type: 'session.created',
@@ -2634,7 +2744,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
     mgr = manager;
 
@@ -2675,7 +2785,7 @@ describe('ForegroundFallbackManager session.status', () => {
       }),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     mgr.registerSessionAgent('child-oracle-sticky', 'oracle');
@@ -2714,7 +2824,7 @@ describe('ForegroundFallbackManager session.status', () => {
       }),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     mgr.registerSessionAgent('child-oracle-agent-body', 'oracle');
@@ -2754,7 +2864,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2785,7 +2895,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2867,7 +2977,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2901,7 +3011,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2935,7 +3045,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2967,7 +3077,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
+      0,
     );
 
     await mgr.handleEvent({
@@ -2996,10 +3106,15 @@ describe('ForegroundFallbackManager session.status', () => {
   test('does not toast when 410 signal arrives via status.message with no error property', async () => {
     const { mocks } = createMockClient();
     const showToast = mock(async () => ({}));
-    const mgr = new ForegroundFallbackManager(makeChains(), true, {
-      directory: '/test',
-      client: { tui: { showToast } },
-    } as any);
+    const mgr = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+        client: { tui: { showToast } },
+      } as any,
+      0,
+    );
 
     await mgr.handleEvent({
       type: 'message.updated',
@@ -3032,7 +3147,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     await mgr.handleEvent({
@@ -3090,7 +3205,7 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      3,
+      0,
     );
 
     // Seed session with model A (anthropic/claude-opus-4-5)
@@ -3166,8 +3281,8 @@ describe('ForegroundFallbackManager session.status', () => {
       makeChains(),
       true,
       { directory: '/test' } as any,
-      1,
-    ); // maxRetries=1 for immediate fallback
+      0,
+    ); // No host retries: test the model-change guard directly.
 
     // Seed session with model A
     await mgr.handleEvent({

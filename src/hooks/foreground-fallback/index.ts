@@ -357,8 +357,8 @@ export class ForegroundFallbackManager {
    *  when the model has changed, allowing the cascade to continue when a
    *  new fallback model also fails within the dedup window. */
   private readonly lastTriggerModel = new Map<string, string>();
-  /** sessionID -> consecutive 429 count for the current model.
-   *  Reset on model swap or session deletion. */
+  /** sessionID -> absorbed host retries in the current fallback descent.
+   *  Reset on recovery, fresh primary descent, or session deletion. */
   private readonly sessionRetries = new Map<string, number>();
   /** sessionID -> pending initial delay timeout handle.
    *  Cleared on recovery or session deletion. */
@@ -518,7 +518,7 @@ export class ForegroundFallbackManager {
     private chains: Record<string, string[]>,
     private readonly enabled: boolean,
     private readonly input: PluginInput,
-    /** Consecutive 429s tolerated on the same model before swap/abort. */
+    /** Host retry events tolerated before the first model switch. */
     private readonly maxRetries: number = 3,
     coordinator?: SessionLifecycle,
     onSessionModelChanged?: (sessionID: string, model: string) => void,
@@ -628,7 +628,7 @@ export class ForegroundFallbackManager {
           typeof messageTime.completed === 'number';
         // Failover-worthy error on an individual message
         if (info.error && isFailoverError(info.error)) {
-          if (this.shouldTriggerFallback(sessionID)) {
+          if (!this.delayInitialFallback(sessionID, false)) {
             await this.tryFallback(sessionID, info.error);
           }
         } else if (isCompletedSuccessfulAssistant) {
@@ -665,7 +665,7 @@ export class ForegroundFallbackManager {
           sessionID &&
           props.error &&
           isFailoverError(props.error) &&
-          this.shouldTriggerFallback(sessionID)
+          !this.delayInitialFallback(sessionID, false)
         ) {
           await this.tryFallback(sessionID, props.error);
         }
@@ -714,7 +714,9 @@ export class ForegroundFallbackManager {
           }
           // Otherwise (attempt === 1, or model didn't change, or outside
           // dedup window): process as genuine retry for current model.
-          if (this.shouldTriggerFallback(sessionID, true)) {
+          this.rearmIfFreshDescent(sessionID);
+          if (this.absorbHostRetry(sessionID)) break;
+          if (!this.delayInitialFallback(sessionID, true)) {
             // Failover may have been detected from status.message (e.g.
             // 'AI_APICallError: Gone') with no separate error property;
             // forward that message so 401/410 inline errors suppress the
@@ -875,65 +877,55 @@ export class ForegroundFallbackManager {
   // Retry budget
   // ---------------------------------------------------------------------------
 
-  /** Increment retry counter and return true when the budget is exhausted.
-   *  Used by shouldIntervene when tried > 0 — each retry counts toward the
-   *  budget and only triggers fallback after maxRetries - 1 absorptions.
-   *  First failover retry (tried === 0) bypasses the counter via shouldIntervene. */
-  private consumeRetryBudget(sessionID: string): boolean {
+  /** Return true while the host still has retries available. Exhaustion
+   *  leaves the counter charged for the remainder of the chain descent. */
+  private absorbHostRetry(sessionID: string): boolean {
     const tried = this.sessionRetries.get(sessionID) ?? 0;
-    if (tried < this.maxRetries - 1) {
+    if (tried < this.maxRetries) {
       this.sessionRetries.set(sessionID, tried + 1);
       log('[foreground-fallback] rate-limit retry', {
         sessionID,
         attempt: tried + 1,
         remaining: this.maxRetries - tried - 1,
       });
-      return false;
-    }
-    this.sessionRetries.delete(sessionID);
-    return true;
-  }
-
-  /** Intervene immediately on first occurrence (tried === 0), otherwise
-   *  delegate to retry budget. Used by all three event paths. */
-  private shouldTriggerFallback(
-    sessionID: string,
-    needsAbort = false,
-  ): boolean {
-    const tried = this.sessionRetries.get(sessionID) ?? 0;
-    if (tried === 0) {
-      if (this.initialRetryDelayMs > 0) {
-        // Don't set sessionRetries here - it would let subsequent errors
-        // consume the retry budget before the delay elapses.
-        log('[foreground-fallback] delaying initial fallback', {
-          sessionID,
-          delayMs: this.initialRetryDelayMs,
-          needsAbort,
-        });
-        // Cancel any existing pending delay for this session
-        const existing = this.pendingInitialDelay.get(sessionID);
-        if (existing) clearTimeout(existing);
-        const handle = setTimeout(() => {
-          this.pendingInitialDelay.delete(sessionID);
-          // Background fallback is fail-soft: a failure must be logged
-          // and swallowed, never escape as an unhandled rejection.
-          // Call tryFallbackWithAbort for session.status retry path
-          const trigger = needsAbort
-            ? this.tryFallbackWithAbort(sessionID)
-            : this.tryFallback(sessionID);
-          void trigger.catch((err) => {
-            log('[foreground-fallback] delayed fallback trigger failed', {
-              sessionID,
-              error: stringifyError(err),
-            });
-          });
-        }, this.initialRetryDelayMs);
-        this.pendingInitialDelay.set(sessionID, handle);
-        return false;
-      }
       return true;
     }
-    return this.consumeRetryBudget(sessionID);
+    return false;
+  }
+
+  /** Defer an intervention when configured, regardless of its trigger path. */
+  private delayInitialFallback(
+    sessionID: string,
+    needsAbort: boolean,
+  ): boolean {
+    if (this.initialRetryDelayMs > 0) {
+      log('[foreground-fallback] delaying initial fallback', {
+        sessionID,
+        delayMs: this.initialRetryDelayMs,
+        needsAbort,
+      });
+      // Cancel any existing pending delay for this session
+      const existing = this.pendingInitialDelay.get(sessionID);
+      if (existing) clearTimeout(existing);
+      const handle = setTimeout(() => {
+        this.pendingInitialDelay.delete(sessionID);
+        // Background fallback is fail-soft: a failure must be logged
+        // and swallowed, never escape as an unhandled rejection.
+        // Call tryFallbackWithAbort for session.status retry path
+        const trigger = needsAbort
+          ? this.tryFallbackWithAbort(sessionID)
+          : this.tryFallback(sessionID);
+        void trigger.catch((err) => {
+          log('[foreground-fallback] delayed fallback trigger failed', {
+            sessionID,
+            error: stringifyError(err),
+          });
+        });
+      }, this.initialRetryDelayMs);
+      this.pendingInitialDelay.set(sessionID, handle);
+      return true;
+    }
+    return false;
   }
 
   // ---------------------------------------------------------------------------
@@ -1099,6 +1091,24 @@ export class ForegroundFallbackManager {
     return false;
   }
 
+  /** A return to the OBSERVED configured primary starts a new descent. An
+   *  inferred head or a dynamic inherit+chain head does not count. */
+  private rearmIfFreshDescent(sessionID: string): void {
+    const observedModel = this.sessionModel.get(sessionID);
+    if (!observedModel) return;
+    const tried = this.sessionTried.get(sessionID);
+    if (!tried || tried.size <= 1) return;
+    const agentName = this.sessionAgent.get(sessionID);
+    const configuredChain =
+      agentName === undefined ? undefined : this.chains[agentName];
+    const rearmHead =
+      configuredChain?.[0] ?? this.resolveChain(agentName, observedModel)[0];
+    if (observedModel !== rearmHead) return;
+    this.sessionTried.set(sessionID, new Set());
+    this.sessionRetries.delete(sessionID);
+    this.chainExhaustion.delete(sessionID);
+  }
+
   private selectFallbackModel(sessionID: string) {
     const observedModel = this.sessionModel.get(sessionID);
     let currentModel = observedModel;
@@ -1106,17 +1116,6 @@ export class ForegroundFallbackManager {
     const chain = this.resolveChain(agentName, currentModel);
     // Callers pre-check via hasFallbackChain; keep as defensive guard only.
     if (!chain.length) return;
-    // The CONFIGURED chain head, not resolveChain's resolved head: a combined
-    // inherit+chain session prepends its live model as a dynamic head that
-    // by construction always equals observedModel, so comparing against
-    // chain[0] there would re-arm every error and ping-pong the descent
-    // (reset → re-descend → exhaust → reset again). Only an observed return
-    // to the configured primary re-arms. Unknown agents resolve a static
-    // chain, where chain[0] already is the configured head.
-    const configuredChain =
-      agentName === undefined ? undefined : this.chains[agentName];
-    const rearmHead = configuredChain?.[0] ?? chain[0];
-
     // When the agent is known but no model was captured (common for
     // subagent error events that fire before message.updated), infer
     // the current model as the chain's first entry. Without this, the
@@ -1129,9 +1128,6 @@ export class ForegroundFallbackManager {
     if (!this.sessionTried.has(sessionID)) {
       this.sessionTried.set(sessionID, new Set());
     }
-    // biome-ignore lint/style/noNonNullAssertion: We just set this above
-    let tried = this.sessionTried.get(sessionID)!;
-
     // A new user turn always re-sends the agent's configured primary:
     // promptAsync's `model` is a per-message override, so a fallback never
     // persists past the message it was applied to. Landing here on the
@@ -1152,19 +1148,9 @@ export class ForegroundFallbackManager {
     // (tried.add(nextModel) below), so there is stale state to clear. A
     // single-entry chain never gets there and must stay terminal after its
     // one abort rather than re-aborting on every error.
-    if (
-      observedModel !== undefined &&
-      observedModel === rearmHead &&
-      tried.size > 1
-    ) {
-      tried = new Set();
-      this.sessionTried.set(sessionID, tried);
-      // A descent that ended in a stage-2 abort is never followed by a
-      // successful assistant message, so the message.updated recovery path
-      // cannot clear chainExhaustion and fallback would stay disabled for
-      // the rest of the session. A fresh descent earns a fresh chance.
-      this.chainExhaustion.delete(sessionID);
-    }
+    this.rearmIfFreshDescent(sessionID);
+    // biome-ignore lint/style/noNonNullAssertion: We just set this above
+    let tried = this.sessionTried.get(sessionID)!;
 
     // After the chain has been exhausted twice (reset retry failed and we
     // aborted), do not intervene again for this session: re-entering would
@@ -1223,8 +1209,6 @@ export class ForegroundFallbackManager {
       }
     }
     tried.add(nextModel);
-    // Reset retry count on model switch - the new model starts fresh.
-    this.sessionRetries.delete(sessionID);
     this.lastFallbackTime.delete(sessionID);
     // Cancel any pending initial delay on model switch
     const pendingDelay = this.pendingInitialDelay.get(sessionID);
