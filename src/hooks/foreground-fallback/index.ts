@@ -563,7 +563,11 @@ export class ForegroundFallbackManager {
    *  Cleared on recovery or session deletion. */
   private readonly pendingInitialDelay = new Map<
     string,
-    ReturnType<typeof setTimeout>
+    {
+      handle: ReturnType<typeof setTimeout>;
+      needsAbort: boolean;
+      error?: unknown;
+    }
   >();
   /** sessionID -> timestamp of last fallback attempt.
    *  Used to enforce retryDelayMs between consecutive attempts. */
@@ -732,8 +736,8 @@ export class ForegroundFallbackManager {
    *  transcript read runs through the destroyed generation's client. */
   dispose(): void {
     this.disposed = true;
-    for (const handle of this.pendingInitialDelay.values()) {
-      clearTimeout(handle);
+    for (const pending of this.pendingInitialDelay.values()) {
+      clearTimeout(pending.handle);
     }
     this.pendingInitialDelay.clear();
     this.pendingReplay.clear();
@@ -843,7 +847,7 @@ export class ForegroundFallbackManager {
         // Cancel any pending initial delay
         const pendingDelay = this.pendingInitialDelay.get(id);
         if (pendingDelay) {
-          clearTimeout(pendingDelay);
+          clearTimeout(pendingDelay.handle);
           this.pendingInitialDelay.delete(id);
         }
       });
@@ -937,7 +941,7 @@ export class ForegroundFallbackManager {
           // Cancel any pending initial delay on recovery
           const pendingDelay = this.pendingInitialDelay.get(sessionID);
           if (pendingDelay) {
-            clearTimeout(pendingDelay);
+            clearTimeout(pendingDelay.handle);
             this.pendingInitialDelay.delete(sessionID);
           }
         }
@@ -1089,7 +1093,7 @@ export class ForegroundFallbackManager {
           this.lastFallbackTime.delete(id);
           const pendingDelay = this.pendingInitialDelay.get(id);
           if (pendingDelay) {
-            clearTimeout(pendingDelay);
+            clearTimeout(pendingDelay.handle);
             this.pendingInitialDelay.delete(id);
           }
           this.pendingReplay.delete(id);
@@ -1296,6 +1300,11 @@ export class ForegroundFallbackManager {
       return 'absorb';
     }
     if (permanentUsageQuota) {
+      const pendingDelay = this.pendingInitialDelay.get(sessionID);
+      if (pendingDelay) {
+        clearTimeout(pendingDelay.handle);
+        this.pendingInitialDelay.delete(sessionID);
+      }
       log('[foreground-fallback] permanent usage/quota failure', {
         sessionID,
         needsAbort,
@@ -1307,8 +1316,13 @@ export class ForegroundFallbackManager {
     }
     if (this.initialRetryDelayMs > 0) {
       if (this.pendingInitialDelay.has(sessionID)) {
-        // A delayed trigger is already pending and will fire soon;
-        // errors arriving meanwhile must not jump the queue.
+        // Preserve the first trigger's deadline while keeping its action
+        // current: host retries require an abort, terminal errors replay.
+        const pending = this.pendingInitialDelay.get(sessionID);
+        if (pending) {
+          pending.needsAbort = needsAbort;
+          pending.error = error;
+        }
         return 'fallback-delayed';
       }
       if (!this.initialDelayScheduled.has(sessionID)) {
@@ -1319,13 +1333,15 @@ export class ForegroundFallbackManager {
           needsAbort,
         });
         const handle = setTimeout(() => {
+          const pending = this.pendingInitialDelay.get(sessionID);
+          if (!pending) return;
           this.pendingInitialDelay.delete(sessionID);
           // Background fallback is fail-soft: a failure must be logged
           // and swallowed, never escape as an unhandled rejection.
           // Call tryFallbackWithAbort for session.status retry path
-          const trigger = needsAbort
-            ? this.tryFallbackWithAbort(sessionID, error)
-            : this.tryFallback(sessionID, error);
+          const trigger = pending.needsAbort
+            ? this.tryFallbackWithAbort(sessionID, pending.error)
+            : this.tryFallback(sessionID, pending.error);
           void trigger.catch((err) => {
             log('[foreground-fallback] delayed fallback trigger failed', {
               sessionID,
@@ -1333,7 +1349,7 @@ export class ForegroundFallbackManager {
             });
           });
         }, this.initialRetryDelayMs);
-        this.pendingInitialDelay.set(sessionID, handle);
+        this.pendingInitialDelay.set(sessionID, { handle, needsAbort, error });
         return 'fallback-delayed';
       }
     }
@@ -1700,7 +1716,7 @@ export class ForegroundFallbackManager {
     // previous descent's spent budget must not carry into the new request.
     const pendingDelay = this.pendingInitialDelay.get(sessionID);
     if (pendingDelay) {
-      clearTimeout(pendingDelay);
+      clearTimeout(pendingDelay.handle);
       this.pendingInitialDelay.delete(sessionID);
     }
     this.sessionTried.delete(sessionID);
@@ -1963,7 +1979,7 @@ export class ForegroundFallbackManager {
     // Cancel any pending initial delay on model switch
     const pendingDelay = this.pendingInitialDelay.get(sessionID);
     if (pendingDelay) {
-      clearTimeout(pendingDelay);
+      clearTimeout(pendingDelay.handle);
       this.pendingInitialDelay.delete(sessionID);
     }
 

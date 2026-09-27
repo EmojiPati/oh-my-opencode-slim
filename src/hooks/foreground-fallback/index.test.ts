@@ -6294,6 +6294,132 @@ describe('ForegroundFallbackManager retry budget', () => {
     });
   });
 
+  test('repeated retries preserve the first initial fallback deadline', async () => {
+    jest.useFakeTimers();
+    try {
+      const { mocks, mgr } = createBudgetManager(0, 100);
+      const sessionID = 'sess-fixed-fallback-deadline';
+      await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+      await mgr.handleEvent(errorEvent(sessionID));
+      expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+      jest.advanceTimersByTime(60);
+      await mgr.handleEvent(errorEvent(sessionID));
+      jest.advanceTimersByTime(39);
+      expect(mocks.promptAsync).not.toHaveBeenCalled();
+
+      jest.advanceTimersByTime(1);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-c',
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('a pending retry delay replays without abort when a terminal error arrives', async () => {
+    jest.useFakeTimers();
+    try {
+      const { mocks } = createMockClient();
+      const showToast = mock(async () => ({}));
+      const mgr = new ForegroundFallbackManager(
+        { orchestrator: ['openai/gpt-b', 'openai/gpt-c'] },
+        true,
+        { directory: '/test', client: { tui: { showToast } } } as any,
+        0,
+        undefined,
+        undefined,
+        100,
+        0,
+      );
+      const sessionID = 'sess-delay-retry-to-terminal';
+      await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+      await mgr.handleEvent({
+        type: 'session.status',
+        properties: {
+          sessionID,
+          status: { type: 'retry', attempt: 1, message: 'rate limit' },
+        },
+      });
+      jest.advanceTimersByTime(40);
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: {
+          sessionID,
+          error: { statusCode: 410, message: 'Gone' },
+        },
+      });
+
+      jest.advanceTimersByTime(60);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      expect(mocks.abort).not.toHaveBeenCalled();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-c',
+      });
+      expect(showToast).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('a pending terminal delay aborts when a host retry arrives', async () => {
+    jest.useFakeTimers();
+    try {
+      const { mocks, mgr } = createBudgetManager(0, 100);
+      const sessionID = 'sess-delay-terminal-to-retry';
+      await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+      await mgr.handleEvent(errorEvent(sessionID));
+      jest.advanceTimersByTime(40);
+      await mgr.handleEvent({
+        type: 'session.status',
+        properties: {
+          sessionID,
+          status: { type: 'retry', attempt: 1, message: 'rate limit' },
+        },
+      });
+
+      jest.advanceTimersByTime(60);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-c',
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test.each(['success', 'dispose'] as const)(
+    'a pending initial delay is cancelled by %s',
+    async (cancellation) => {
+      jest.useFakeTimers();
+      try {
+        const { mocks, mgr } = createBudgetManager(0, 100);
+        const sessionID = `sess-delay-${cancellation}-cancel`;
+        await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+        await mgr.handleEvent(errorEvent(sessionID));
+        expect((mgr as any).pendingInitialDelay.size).toBe(1);
+        if (cancellation === 'success') {
+          await mgr.handleEvent(successEvent(sessionID, 'gpt-b'));
+        } else {
+          mgr.dispose();
+        }
+        jest.advanceTimersByTime(100);
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+        expect(mocks.promptAsync).not.toHaveBeenCalled();
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
+
   test('permanent usage limits skip same-model retries even with budget remaining', async () => {
     const { mocks, mgr } = createBudgetManager(3);
     const sessionID = 'sess-permanent-usage';
@@ -6474,6 +6600,38 @@ describe('ForegroundFallbackManager retry budget', () => {
       providerID: 'openai',
       modelID: 'gpt-c',
     });
+  });
+
+  test('a permanent quota error supersedes an ordinary pending delay', async () => {
+    jest.useFakeTimers();
+    try {
+      const { mocks, mgr } = createBudgetManager(0, 100);
+      const sessionID = 'sess-permanent-supersedes-delay';
+      await mgr.handleEvent(seedModelEvent(sessionID, 'gpt-b'));
+      await mgr.handleEvent(errorEvent(sessionID));
+      expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+      await mgr.handleEvent({
+        type: 'session.error',
+        properties: {
+          sessionID,
+          error: { message: 'Monthly usage limit reached' },
+        },
+      });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      expect((mgr as any).pendingInitialDelay.size).toBe(0);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync.mock.calls[0]?.[0].body.model).toEqual({
+        providerID: 'openai',
+        modelID: 'gpt-c',
+      });
+
+      jest.advanceTimersByTime(100);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test('an ordinary 429 still uses the initial retry delay', async () => {
