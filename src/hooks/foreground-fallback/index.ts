@@ -908,9 +908,8 @@ export class ForegroundFallbackManager {
         delayMs: this.initialRetryDelayMs,
         needsAbort,
       });
-      // Cancel any existing pending delay for this session
-      const existing = this.pendingInitialDelay.get(sessionID);
-      if (existing) clearTimeout(existing);
+      // Keep the first trigger's deadline and abort semantics.
+      if (this.pendingInitialDelay.has(sessionID)) return true;
       const handle = setTimeout(() => {
         this.pendingInitialDelay.delete(sessionID);
         // Background fallback is fail-soft: a failure must be logged

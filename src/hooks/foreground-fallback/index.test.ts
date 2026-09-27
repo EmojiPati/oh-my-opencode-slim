@@ -183,10 +183,12 @@ const redoEvents = {
 function makeManager({
   chain = ['test/a', 'test/b', 'test/c'],
   maxRetries = 3,
+  initialRetryDelayMs = 0,
   onChanged,
 }: {
   chain?: string[];
   maxRetries?: number;
+  initialRetryDelayMs?: number;
   onChanged?: (sessionID: string, model: string) => void;
 } = {}) {
   const { mocks } = createMockClient({
@@ -205,7 +207,7 @@ function makeManager({
       maxRetries,
       undefined,
       onChanged,
-      0,
+      initialRetryDelayMs,
       0,
     ),
     mocks,
@@ -240,6 +242,30 @@ describe('foreground fallback redo: host retry budget', () => {
     jest.setSystemTime(1_000_000);
   });
   afterEach(() => jest.useRealTimers());
+
+  test('G2: retry statuses do not postpone the first scheduled abort', async () => {
+    const sid = 'stable-initial-delay';
+    const { manager, mocks } = makeManager({
+      maxRetries: 0,
+      initialRetryDelayMs: 1_000,
+    });
+    await manager.handleEvent(redoEvents.assistant(sid));
+    await manager.handleEvent(redoEvents.retry(sid));
+    jest.advanceTimersByTime(600);
+    await manager.handleEvent(redoEvents.retry(sid, 2));
+    expect(mocks.abort).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(400);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+    jest.advanceTimersByTime(600);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
 
   test.each([0, 1, 3])(
     'T1: %i host retries are absorbed before the first switch, not renewed by the switch',
