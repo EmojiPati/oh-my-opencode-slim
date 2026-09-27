@@ -703,7 +703,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
       revivedRunTracker,
     });
     foregroundFallback = new ForegroundFallbackManager(
-      runtime.runtimeChains,
+      runtime.modelArrays,
       runtime.fallback.enabled !== false,
       ctx,
       runtime.fallback.maxRetries,

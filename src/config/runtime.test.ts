@@ -172,7 +172,6 @@ describe('RuntimeConfig', () => {
     expect(runtime.stripOrchestratorModel).toBe(false);
     expect(runtime.setDefaultAgent).toBe(true);
     expect(runtime.compactSidebar).toBe(true);
-    expect(runtime.runtimeChains).toEqual({});
     expect(runtime.primaryModel).toBeUndefined();
     expect(runtime.host()).toBeUndefined();
     expect(runtime.hostAgent('explorer')).toBeUndefined();
@@ -218,7 +217,7 @@ describe('RuntimeConfig', () => {
     expect(runtime.multiplexer.type).toBe('tmux');
   });
 
-  test('runtimeChains derives from array models, alias-aware', () => {
+  test('modelArrays derives from array models, alias-aware', () => {
     resetRegistry();
     const runtime = RuntimeConfig.init(DIRECTORY, {
       agents: {
@@ -233,9 +232,9 @@ describe('RuntimeConfig', () => {
         },
       },
     });
-    expect(runtime.runtimeChains).toEqual({
-      explorer: ['provider/a', 'provider/b'],
-      fixer: ['provider/x', 'provider/y'],
+    expect(runtime.modelArrays).toEqual({
+      explorer: [{ id: 'provider/a' }, { id: 'provider/b' }],
+      fixer: [{ id: 'provider/x', variant: 'variant' }, { id: 'provider/y' }],
     });
   });
 
@@ -393,14 +392,9 @@ describe('RuntimeConfig', () => {
     ]);
     // single-model councillor has no chain
     expect(runtime.modelArrays['councillor-beta']).toBeUndefined();
-    // chains derive from modelArrays (councillor chains included)
-    expect(runtime.runtimeChains['councillor-alpha']).toEqual([
-      'provider/a1',
-      'provider/a2',
-    ]);
   });
 
-  test('modelArrays and runtimeChains retain nested spaced IDs and variants', () => {
+  test('modelArrays retains nested spaced IDs and variants', () => {
     resetRegistry();
     const runtime = RuntimeConfig.init(DIRECTORY, {
       preset: 'spaced',
@@ -427,11 +421,6 @@ describe('RuntimeConfig', () => {
       },
       { id: 'of/Kimi K2.6', variant: 'balanced' },
       { id: 'opencode-omniroute-live/of/Qwen3.8 27b' },
-    ]);
-    expect(runtime.runtimeChains.explorer).toEqual([
-      'opencode-omniroute-live/of/MiniMax M3',
-      'of/Kimi K2.6',
-      'opencode-omniroute-live/of/Qwen3.8 27b',
     ]);
   });
 

@@ -338,6 +338,11 @@ function getProcessFallbacksInProgress(): Set<string> {
  * (built from _modelArray entries in agents.<name>.model).
  */
 export class ForegroundFallbackManager {
+  private readonly chains: Record<string, string[]> = {};
+  private readonly chainEntries: Record<
+    string,
+    Array<{ id: string; variant?: string }>
+  > = {};
   /** sessionID → last observed model string ("providerID/modelID") */
   private readonly sessionModel = new Map<string, string>();
   /** sessionID → agent name (populated from message.updated info.agent field) */
@@ -452,8 +457,9 @@ export class ForegroundFallbackManager {
   disableChain(agentName: string): void {
     // Keep the key present (known agent, no chain) rather than deleting it,
     // so resolveChain's "known agent without a chain" path applies and the
-    // shared runtimeChains reference retains the agent entry.
+    // normalized chains retain the agent entry.
     this.chains[agentName] = [];
+    this.chainEntries[agentName] = [];
   }
 
   registerSessionAgent(sessionID: string, agentName: string): void {
@@ -515,7 +521,10 @@ export class ForegroundFallbackManager {
      * e.g. { orchestrator: ['anthropic/claude-opus-4-5', 'openai/gpt-4o'] }
      * The first model that hasn't been tried yet is selected on each fallback.
      */
-    private chains: Record<string, string[]>,
+    chains: Record<
+      string,
+      ReadonlyArray<string | { id: string; variant?: string }>
+    >,
     private readonly enabled: boolean,
     private readonly input: PluginInput,
     /** Host retry events tolerated before the first model switch. */
@@ -558,6 +567,13 @@ export class ForegroundFallbackManager {
     /** Synchronous check for running background children OF this session. */
     private readonly hasRunningChildren?: (sessionID: string) => boolean,
   ) {
+    for (const [agentName, entries] of Object.entries(chains)) {
+      const normalized = entries.map((entry) =>
+        typeof entry === 'string' ? { id: entry } : entry,
+      );
+      this.chainEntries[agentName] = normalized;
+      this.chains[agentName] = normalized.map((entry) => entry.id);
+    }
     this.onSessionModelChanged = onSessionModelChanged;
     this.backgroundFallbackHandoff = backgroundFallbackHandoff;
     this.readBackgroundGeneration = readBackgroundGeneration;
@@ -818,11 +834,12 @@ export class ForegroundFallbackManager {
       }
       const selected = this.selectFallbackModel(sessionID);
       if (!selected || selected === 'exhausted') return;
-      const { agentName, nextModel, ref } = selected;
+      const { agentName, nextModel, ref, variant } = selected;
       picked = nextModel;
       switchRequest = switchModel(sessionID, {
         providerID: ref.providerID,
         id: ref.modelID,
+        ...(variant ? { variant } : {}),
       });
       await withTimeout(
         switchRequest,
@@ -1230,7 +1247,11 @@ export class ForegroundFallbackManager {
       });
       return;
     }
-    return { agentName, currentModel, nextModel, ref };
+    const variant = agentName
+      ? this.chainEntries[agentName]?.find((entry) => entry.id === nextModel)
+          ?.variant
+      : undefined;
+    return { agentName, currentModel, nextModel, ref, variant };
   }
 
   private async execFallback(
@@ -1252,7 +1273,7 @@ export class ForegroundFallbackManager {
         await abortSessionWithTimeout(getClient(this.input), sessionID);
         return;
       }
-      const { agentName, currentModel, nextModel, ref } = selection;
+      const { agentName, currentModel, nextModel, ref, variant } = selection;
 
       // Retrieve the last user message to re-submit with the fallback model.
       // Fence captured BEFORE any await in the preparation: a board
@@ -1350,9 +1371,11 @@ export class ForegroundFallbackManager {
             ),
           ],
           model: ref,
+          ...(variant ? { variant } : {}),
           ...(agentName ? { agent: agentName } : {}),
         },
         ...(isV2Host ? { modelSwitch: 'required' as const } : {}),
+        ...(isV2Host && variant ? { modelVariant: variant } : {}),
       };
 
       let promptResult: unknown;

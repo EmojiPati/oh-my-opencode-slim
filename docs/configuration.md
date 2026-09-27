@@ -585,6 +585,7 @@ looping. A `/model` pick on such an agent is its follow target; it never
 disables the fallback chain.
 
 An inline `variant` on the first chain entry belongs to that entry's model.
+Foreground fallback replays and v2 retry-hook model switches retain the selected chain entry's `variant`.
 When inheritance makes the agent follow the session model, the inline variant
 is cleared at both the agent layer and the final host config — the followed
 model must not run with a variant meant for a fallback model. Set an explicit

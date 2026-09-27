@@ -421,19 +421,6 @@ export class RuntimeConfig {
   }
 
   /**
-   * Agent name → model chain (ids only), derived from modelArrays.
-   * Was runtimeChains in src/index.ts (alias-aware, disabled excluded,
-   * councillor chains included).
-   */
-  get runtimeChains(): Record<string, string[]> {
-    const chains: Record<string, string[]> = {};
-    for (const [name, models] of Object.entries(this.modelArrays)) {
-      chains[name] = models.map((entry) => entry.id);
-    }
-    return chains;
-  }
-
-  /**
    * The dynamic model source of an agent that combines a fallback model
    * chain (`model: [...]`) with `inheritModelFrom`, or undefined when the
    * agent's model is fully static. Combined agents follow the live

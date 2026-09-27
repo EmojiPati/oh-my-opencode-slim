@@ -184,11 +184,13 @@ function makeManager({
   chain = ['test/a', 'test/b', 'test/c'],
   maxRetries = 3,
   initialRetryDelayMs = 0,
+  hostFlavor,
   onChanged,
 }: {
-  chain?: string[];
+  chain?: ReadonlyArray<string | { id: string; variant?: string }>;
   maxRetries?: number;
   initialRetryDelayMs?: number;
+  hostFlavor?: 'v2';
   onChanged?: (sessionID: string, model: string) => void;
 } = {}) {
   const { mocks } = createMockClient({
@@ -203,7 +205,7 @@ function makeManager({
     manager: new ForegroundFallbackManager(
       { orchestrator: chain },
       true,
-      { directory: '/test' } as never,
+      { directory: '/test', hostFlavor } as never,
       maxRetries,
       undefined,
       onChanged,
@@ -516,6 +518,71 @@ describe('foreground fallback redo: host retry budget', () => {
     await manager.handleV2Retry(host, switchModel);
     expect(switchModel).not.toHaveBeenCalled();
     expect(host.decision).toEqual({ retry: true, delay: 77 });
+  });
+
+  test.each([
+    ['v1', undefined],
+    ['v2', 'v2'],
+  ] as const)(
+    'T8: %s replay carries the fallback entry variant',
+    async (label, hostFlavor) => {
+      const sid = `variant-replay-${label}`;
+      const { manager, mocks } = makeManager({
+        chain: ['test/a', { id: 'test/b', variant: 'fast' }],
+        hostFlavor,
+      });
+      await manager.handleEvent(redoEvents.assistant(sid));
+      await manager.handleEvent(redoEvents.error(sid));
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+        body: { model: { providerID: 'test', modelID: 'b' }, variant: 'fast' },
+        ...(hostFlavor ? { modelVariant: 'fast' } : {}),
+      });
+    },
+  );
+
+  test('T9: v2 retry hook switches with the fallback entry variant', async () => {
+    const { manager } = makeManager({
+      chain: ['test/a', { id: 'test/b', variant: 'fast' }],
+    });
+    const switchModel = mock(async () => {});
+    await manager.handleV2Retry(
+      retryEvent('variant-hook', 'a', { retry: false }),
+      switchModel,
+    );
+    expect(switchModel).toHaveBeenCalledWith('variant-hook', {
+      providerID: 'test',
+      id: 'b',
+      variant: 'fast',
+    });
+  });
+
+  test('T10: entries without a variant add no replay or switch keys', async () => {
+    for (const hostFlavor of [undefined, 'v2'] as const) {
+      const sid = `no-variant-${hostFlavor ?? 'v1'}`;
+      const { manager, mocks } = makeManager({
+        chain: ['test/a', 'test/b'],
+        hostFlavor,
+      });
+      await manager.handleEvent(redoEvents.assistant(sid));
+      await manager.handleEvent(redoEvents.error(sid));
+      const call = mocks.promptAsync.mock.calls[0]?.[0] as {
+        body: Record<string, unknown>;
+      };
+      expect(Object.hasOwn(call.body, 'variant')).toBe(false);
+      expect(Object.hasOwn(call, 'modelVariant')).toBe(false);
+    }
+    const { manager } = makeManager({ chain: ['test/a', 'test/b'] });
+    const refs: Array<{ providerID: string; id: string; variant?: string }> =
+      [];
+    await manager.handleV2Retry(
+      retryEvent('no-variant-hook', 'a', { retry: false }),
+      async (_sid, ref) => {
+        refs.push(ref);
+      },
+    );
+    expect(refs).toHaveLength(1);
+    expect(Object.hasOwn(refs[0], 'variant')).toBe(false);
   });
 });
 
@@ -4732,14 +4799,14 @@ describe('ForegroundFallbackManager session.deleted', () => {
 
   test('shares fallback progress across plugin manager instances', () => {
     const first = new ForegroundFallbackManager(
-      createMockClient().client,
       makeChains(),
       true,
+      createMockClient().client,
     );
     const replacement = new ForegroundFallbackManager(
-      createMockClient().client,
       makeChains(),
       true,
+      createMockClient().client,
     );
     const sessionID = 'sess-shared-in-progress';
 
@@ -4804,7 +4871,7 @@ describe('ForegroundFallbackManager willAttemptFallback', () => {
 
 describe('ForegroundFallbackManager resolveChain cross-agent isolation', () => {
   test('does not use another agent chain when known agent has no configured chain', async () => {
-    // oracle has no chain in runtimeChains; without the fix resolveChain would
+    // oracle has no configured chain; without the fix resolveChain would
     // fall through to the cross-agent "last resort" and pick a model from
     // orchestrator's chain - re-prompting oracle with an orchestrator model.
     const { mocks } = createMockClient();
