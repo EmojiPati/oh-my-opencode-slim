@@ -565,8 +565,9 @@ export class ForegroundFallbackManager {
     string,
     {
       handle: ReturnType<typeof setTimeout>;
-      needsAbort: boolean;
-      error?: unknown;
+      hasTerminalFallback: boolean;
+      latestNeedsAbort: boolean;
+      latestError?: unknown;
     }
   >();
   /** sessionID -> timestamp of last fallback attempt.
@@ -1302,15 +1303,11 @@ export class ForegroundFallbackManager {
     if (permanentUsageQuota) {
       const pendingDelay = this.pendingInitialDelay.get(sessionID);
       if (pendingDelay) {
-        if (
-          needsAbort &&
-          !pendingDelay.needsAbort &&
-          this.withholdsAbortForLiveChildren(sessionID)
-        ) {
-          // Keep the terminal replay at its original deadline when the v1
-          // child guard would refuse the retry's abort. Carry the quota error
-          // forward so fallback selection still treats it as permanent.
-          pendingDelay.error = error;
+        if (needsAbort && pendingDelay.hasTerminalFallback) {
+          // Keep the terminal replay alternative until the fixed deadline.
+          // The child guard is evaluated then, against the latest live state.
+          pendingDelay.latestNeedsAbort = true;
+          pendingDelay.latestError = error;
           return 'fallback-delayed';
         }
         clearTimeout(pendingDelay.handle);
@@ -1327,20 +1324,13 @@ export class ForegroundFallbackManager {
     }
     if (this.initialRetryDelayMs > 0) {
       if (this.pendingInitialDelay.has(sessionID)) {
-        // Preserve the first trigger's deadline while keeping its action
-        // current: host retries require an abort, terminal errors replay.
+        // Preserve the first deadline and both the terminal replay alternative
+        // and the latest event action. Child availability is checked at fire.
         const pending = this.pendingInitialDelay.get(sessionID);
         if (pending) {
-          if (
-            needsAbort &&
-            !pending.needsAbort &&
-            this.withholdsAbortForLiveChildren(sessionID)
-          ) {
-            pending.error = error;
-            return 'fallback-delayed';
-          }
-          pending.needsAbort = needsAbort;
-          pending.error = error;
+          if (!needsAbort) pending.hasTerminalFallback = true;
+          pending.latestNeedsAbort = needsAbort;
+          pending.latestError = error;
         }
         return 'fallback-delayed';
       }
@@ -1358,9 +1348,19 @@ export class ForegroundFallbackManager {
           // Background fallback is fail-soft: a failure must be logged
           // and swallowed, never escape as an unhandled rejection.
           // Call tryFallbackWithAbort for session.status retry path
-          const trigger = pending.needsAbort
-            ? this.tryFallbackWithAbort(sessionID, pending.error)
-            : this.tryFallback(sessionID, pending.error);
+          const trigger = pending.latestNeedsAbort
+            ? this.withholdsAbortForLiveChildren(sessionID)
+              ? pending.hasTerminalFallback
+                ? this.tryFallback(sessionID, pending.latestError)
+                : Promise.resolve()
+              : this.tryFallbackWithAbort(
+                  sessionID,
+                  pending.latestError,
+                  pending.hasTerminalFallback,
+                )
+            : pending.hasTerminalFallback
+              ? this.tryFallback(sessionID, pending.latestError)
+              : Promise.resolve();
           void trigger.catch((err) => {
             log('[foreground-fallback] delayed fallback trigger failed', {
               sessionID,
@@ -1368,7 +1368,12 @@ export class ForegroundFallbackManager {
             });
           });
         }, this.initialRetryDelayMs);
-        this.pendingInitialDelay.set(sessionID, { handle, needsAbort, error });
+        this.pendingInitialDelay.set(sessionID, {
+          handle,
+          hasTerminalFallback: !needsAbort,
+          latestNeedsAbort: needsAbort,
+          latestError: error,
+        });
         return 'fallback-delayed';
       }
     }
@@ -1520,13 +1525,17 @@ export class ForegroundFallbackManager {
   private async tryFallbackWithAbort(
     sessionID: string,
     error?: unknown,
+    terminalFallbackAvailable = false,
   ): Promise<void> {
     if (!sessionID) return;
     // Reload fence at entry (same rationale as tryFallback).
     if (this.abandonedByDispose(sessionID)) return;
     if (this.inProgress.has(sessionID)) return;
     if (!this.hasFallbackChain(sessionID)) return;
-    if (this.withholdsAbortForLiveChildren(sessionID)) return;
+    if (this.withholdsAbortForLiveChildren(sessionID)) {
+      if (terminalFallbackAvailable) await this.tryFallback(sessionID, error);
+      return;
+    }
     if (this.isExhausted(sessionID)) return;
 
     // Capture the turn epoch of the fallback ENTRY: a genuine new user turn
@@ -1540,7 +1549,22 @@ export class ForegroundFallbackManager {
       // Promotion awaited: a reload may have disposed this generation in
       // the meantime — never abort through a stale client.
       if (this.abandonedByDispose(sessionID)) return;
-      if (this.withholdsAbortForLiveChildren(sessionID)) return;
+      if (this.withholdsAbortForLiveChildren(sessionID)) {
+        if (terminalFallbackAvailable) {
+          if ((this.turnEpoch.get(sessionID) ?? 0) !== entryEpoch) {
+            this.logSupersededFallback(sessionID);
+            return;
+          }
+          await this.execFallback(sessionID, error, entryEpoch);
+          if (
+            !this.abandonedByDispose(sessionID) &&
+            (this.turnEpoch.get(sessionID) ?? 0) === entryEpoch
+          ) {
+            this.lastFallbackTime.set(sessionID, Date.now());
+          }
+        }
+        return;
+      }
       if ((this.turnEpoch.get(sessionID) ?? 0) !== entryEpoch) {
         this.logSupersededFallback(sessionID);
         return;

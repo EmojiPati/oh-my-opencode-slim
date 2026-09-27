@@ -2729,6 +2729,166 @@ describe('ForegroundFallbackManager v1 abort protection for live children', () =
     }
   });
 
+  test('T3c: children gone at the deadline allow the latest retry to abort', async () => {
+    jest.useFakeTimers();
+    try {
+      const calls: string[] = [];
+      const { mocks } = createMockClient({
+        postImpl: async () => {
+          calls.push('promote');
+          return {};
+        },
+        abortImpl: async () => {
+          calls.push('abort');
+          return {};
+        },
+        promptAsyncImpl: async () => {
+          calls.push('prompt');
+          return {};
+        },
+      });
+      const handoff = { prepare: 0, admit: 0 };
+      const mgr = new ForegroundFallbackManager(
+        makeChains(),
+        true,
+        { directory: '/test' } as any,
+        0,
+        undefined,
+        undefined,
+        100,
+        0,
+        {
+          prepare: () => {
+            handoff.prepare += 1;
+            return true;
+          },
+          admit: () => {
+            handoff.admit += 1;
+          },
+          reject: () => {},
+          settleUnresolved: () => {},
+        },
+        undefined,
+        observe,
+      );
+      const sessionID = 'sess-delayed-child-finished';
+      await mgr.handleEvent({
+        type: 'session.created',
+        properties: { info: { id: sessionID, parentID: 'sess-parent' } },
+      });
+      live.add(sessionID);
+      await seed(mgr, sessionID);
+      await mgr.handleEvent(error(sessionID));
+      jest.advanceTimersByTime(40);
+      await mgr.handleEvent({
+        type: 'session.status',
+        properties: {
+          sessionID,
+          error: { message: 'Monthly usage limit reached' },
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Monthly usage limit reached',
+          },
+        },
+      });
+      jest.advanceTimersByTime(40);
+      live.delete(sessionID);
+      jest.advanceTimersByTime(20);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+      expect(calls).toEqual(['promote', 'abort', 'prompt']);
+      expect(handoff).toEqual({ prepare: 1, admit: 1 });
+      jest.advanceTimersByTime(100);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    } finally {
+      live.clear();
+      jest.useRealTimers();
+    }
+  });
+
+  test('T3d: a child appearing during promotion uses the terminal alternative', async () => {
+    jest.useFakeTimers();
+    try {
+      const calls: string[] = [];
+      const sessionID = 'sess-child-during-promotion';
+      const { mocks } = createMockClient({
+        postImpl: async () => {
+          calls.push('promote');
+          live.add(sessionID);
+          return {};
+        },
+        abortImpl: async () => {
+          calls.push('abort');
+          return {};
+        },
+        promptAsyncImpl: async () => {
+          calls.push('prompt');
+          return {};
+        },
+      });
+      const handoff = { prepare: 0, admit: 0 };
+      const mgr = new ForegroundFallbackManager(
+        makeChains(),
+        true,
+        { directory: '/test' } as any,
+        0,
+        undefined,
+        undefined,
+        100,
+        0,
+        {
+          prepare: () => {
+            handoff.prepare += 1;
+            return true;
+          },
+          admit: () => {
+            handoff.admit += 1;
+          },
+          reject: () => {},
+          settleUnresolved: () => {},
+        },
+        undefined,
+        observe,
+      );
+      await mgr.handleEvent({
+        type: 'session.created',
+        properties: { info: { id: sessionID, parentID: 'sess-parent' } },
+      });
+      await seed(mgr, sessionID);
+      await mgr.handleEvent(error(sessionID));
+      jest.advanceTimersByTime(40);
+      await mgr.handleEvent({
+        type: 'session.status',
+        properties: {
+          sessionID,
+          error: { message: 'Monthly usage limit reached' },
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Monthly usage limit reached',
+          },
+        },
+      });
+      jest.advanceTimersByTime(60);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+
+      expect(mocks.abort).not.toHaveBeenCalled();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(calls).toEqual(['promote', 'prompt']);
+      expect(handoff).toEqual({ prepare: 1, admit: 1 });
+      jest.advanceTimersByTime(100);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    } finally {
+      live.clear();
+      jest.useRealTimers();
+    }
+  });
+
   test('T4: exhausted chain stops intervening without aborting live children', async () => {
     const { mocks } = createMockClient();
     const mgr = manager(undefined, { orchestrator: ['openai/model-y'] });
