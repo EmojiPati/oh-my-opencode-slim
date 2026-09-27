@@ -594,11 +594,7 @@ export class ForegroundFallbackManager {
         this.chainExhaustion.delete(id);
         this.lastFallbackTime.delete(id);
         // Cancel any pending initial delay
-        const pendingDelay = this.pendingInitialDelay.get(id);
-        if (pendingDelay) {
-          clearTimeout(pendingDelay.timer);
-          this.pendingInitialDelay.delete(id);
-        }
+        this.cancelInitialDelay(id);
       });
     }
   }
@@ -662,11 +658,7 @@ export class ForegroundFallbackManager {
           // deeper.
           this.sessionTried.delete(sessionID);
           // Cancel any pending initial delay on recovery
-          const pendingDelay = this.pendingInitialDelay.get(sessionID);
-          if (pendingDelay) {
-            clearTimeout(pendingDelay.timer);
-            this.pendingInitialDelay.delete(sessionID);
-          }
+          this.cancelInitialDelay(sessionID);
         }
         break;
       }
@@ -731,7 +723,10 @@ export class ForegroundFallbackManager {
           // Otherwise (attempt === 1, or model didn't change, or outside
           // dedup window): process as genuine retry for current model.
           this.rearmIfFreshDescent(sessionID);
-          if (this.absorbHostRetry(sessionID)) break;
+          if (this.absorbHostRetry(sessionID)) {
+            this.cancelInitialDelay(sessionID);
+            break;
+          }
           if (!this.delayInitialFallback(sessionID, true)) {
             // Failover may have been detected from status.message (e.g.
             // 'AI_APICallError: Gone') with no separate error property;
@@ -912,6 +907,13 @@ export class ForegroundFallbackManager {
       return true;
     }
     return false;
+  }
+
+  private cancelInitialDelay(sessionID: string): void {
+    const pending = this.pendingInitialDelay.get(sessionID);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingInitialDelay.delete(sessionID);
   }
 
   /** Defer an intervention when configured, regardless of its trigger path. */
@@ -1239,11 +1241,7 @@ export class ForegroundFallbackManager {
     tried.add(nextModel);
     this.lastFallbackTime.delete(sessionID);
     // Cancel any pending initial delay on model switch
-    const pendingDelay = this.pendingInitialDelay.get(sessionID);
-    if (pendingDelay) {
-      clearTimeout(pendingDelay.timer);
-      this.pendingInitialDelay.delete(sessionID);
-    }
+    this.cancelInitialDelay(sessionID);
 
     const ref = parseModelReference(nextModel);
     if (!ref) {

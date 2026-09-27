@@ -288,6 +288,47 @@ describe('foreground fallback redo: host retry budget', () => {
     });
   });
 
+  test('T-N3: an absorbed retry cancels a terminal delay before the next run', async () => {
+    const sid = 'absorbed-retry-cancels-delay';
+    const { manager, mocks } = makeManager({
+      maxRetries: 1,
+      initialRetryDelayMs: 1_000,
+    });
+    await manager.handleEvent(redoEvents.assistant(sid));
+    await manager.handleEvent(redoEvents.error(sid));
+    jest.advanceTimersByTime(300);
+    await manager.handleEvent(redoEvents.retry(sid, 1));
+    jest.advanceTimersByTime(700);
+    expect(mocks.abort).not.toHaveBeenCalled();
+    expect(mocks.promptAsync).not.toHaveBeenCalled();
+    await manager.handleEvent(redoEvents.retry(sid, 2));
+    jest.advanceTimersByTime(1_000);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+  });
+
+  test('T-LOCK: an unabsorbed retry upgrades a terminal delay to abort', async () => {
+    const sid = 'unabsorbed-retry-upgrades-delay';
+    const { manager, mocks } = makeManager({
+      maxRetries: 0,
+      initialRetryDelayMs: 1_000,
+    });
+    await manager.handleEvent(redoEvents.assistant(sid));
+    await manager.handleEvent(redoEvents.error(sid));
+    await manager.handleEvent(redoEvents.retry(sid));
+    jest.advanceTimersByTime(1_000);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+  });
+
   test.each([0, 1, 3])(
     'T1: %i host retries are absorbed before the first switch, not renewed by the switch',
     async (maxRetries) => {
