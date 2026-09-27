@@ -269,6 +269,25 @@ describe('foreground fallback redo: host retry budget', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
   });
 
+  test('N1: terminal error updates the pending deadline to replay without abort', async () => {
+    const sid = 'terminal-during-initial-delay';
+    const { manager, mocks } = makeManager({
+      maxRetries: 0,
+      initialRetryDelayMs: 1_000,
+    });
+    await manager.handleEvent(redoEvents.assistant(sid));
+    await manager.handleEvent(redoEvents.retry(sid));
+    jest.advanceTimersByTime(300);
+    await manager.handleEvent(redoEvents.error(sid));
+    jest.advanceTimersByTime(700);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(mocks.abort).not.toHaveBeenCalled();
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+  });
+
   test.each([0, 1, 3])(
     'T1: %i host retries are absorbed before the first switch, not renewed by the switch',
     async (maxRetries) => {

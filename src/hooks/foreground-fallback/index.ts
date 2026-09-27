@@ -365,11 +365,11 @@ export class ForegroundFallbackManager {
   /** sessionID -> absorbed host retries in the current fallback descent.
    *  Reset on recovery, fresh primary descent, or session deletion. */
   private readonly sessionRetries = new Map<string, number>();
-  /** sessionID -> pending initial delay timeout handle.
+  /** sessionID -> pending initial delay and latest trigger mode.
    *  Cleared on recovery or session deletion. */
   private readonly pendingInitialDelay = new Map<
     string,
-    ReturnType<typeof setTimeout>
+    { timer: ReturnType<typeof setTimeout>; needsAbort: boolean }
   >();
   /** sessionID -> timestamp of last fallback attempt.
    *  Used to enforce retryDelayMs between consecutive attempts. */
@@ -482,8 +482,8 @@ export class ForegroundFallbackManager {
    *  transcript read runs through the destroyed generation's client. */
   dispose(): void {
     this.disposed = true;
-    for (const handle of this.pendingInitialDelay.values()) {
-      clearTimeout(handle);
+    for (const pending of this.pendingInitialDelay.values()) {
+      clearTimeout(pending.timer);
     }
     this.pendingInitialDelay.clear();
   }
@@ -596,7 +596,7 @@ export class ForegroundFallbackManager {
         // Cancel any pending initial delay
         const pendingDelay = this.pendingInitialDelay.get(id);
         if (pendingDelay) {
-          clearTimeout(pendingDelay);
+          clearTimeout(pendingDelay.timer);
           this.pendingInitialDelay.delete(id);
         }
       });
@@ -664,7 +664,7 @@ export class ForegroundFallbackManager {
           // Cancel any pending initial delay on recovery
           const pendingDelay = this.pendingInitialDelay.get(sessionID);
           if (pendingDelay) {
-            clearTimeout(pendingDelay);
+            clearTimeout(pendingDelay.timer);
             this.pendingInitialDelay.delete(sessionID);
           }
         }
@@ -925,14 +925,20 @@ export class ForegroundFallbackManager {
         delayMs: this.initialRetryDelayMs,
         needsAbort,
       });
-      // Keep the first trigger's deadline and abort semantics.
-      if (this.pendingInitialDelay.has(sessionID)) return true;
-      const handle = setTimeout(() => {
+      // Keep the first deadline, but follow the latest trigger's abort mode.
+      const pending = this.pendingInitialDelay.get(sessionID);
+      if (pending) {
+        pending.needsAbort = needsAbort;
+        return true;
+      }
+      const timer = setTimeout(() => {
+        const latest = this.pendingInitialDelay.get(sessionID);
+        if (!latest) return;
         this.pendingInitialDelay.delete(sessionID);
         // Background fallback is fail-soft: a failure must be logged
         // and swallowed, never escape as an unhandled rejection.
         // Call tryFallbackWithAbort for session.status retry path
-        const trigger = needsAbort
+        const trigger = latest.needsAbort
           ? this.tryFallbackWithAbort(sessionID)
           : this.tryFallback(sessionID);
         void trigger.catch((err) => {
@@ -942,7 +948,7 @@ export class ForegroundFallbackManager {
           });
         });
       }, this.initialRetryDelayMs);
-      this.pendingInitialDelay.set(sessionID, handle);
+      this.pendingInitialDelay.set(sessionID, { timer, needsAbort });
       return true;
     }
     return false;
@@ -1235,7 +1241,7 @@ export class ForegroundFallbackManager {
     // Cancel any pending initial delay on model switch
     const pendingDelay = this.pendingInitialDelay.get(sessionID);
     if (pendingDelay) {
-      clearTimeout(pendingDelay);
+      clearTimeout(pendingDelay.timer);
       this.pendingInitialDelay.delete(sessionID);
     }
 
