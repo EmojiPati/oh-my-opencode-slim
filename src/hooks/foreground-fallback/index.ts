@@ -964,7 +964,10 @@ export class ForegroundFallbackManager {
               const d = this.decideIntervention(sessionID, false, props.error);
               if (d === 'absorb') {
                 await this.retryCurrentModel(sessionID, props.error);
-              } else if (d === 'fallback') {
+              } else if (
+                d === 'fallback' ||
+                d === 'fallback-with-terminal-alternative'
+              ) {
                 await this.tryFallback(sessionID, props.error);
               }
               // fallback-delayed → nothing
@@ -1025,12 +1028,16 @@ export class ForegroundFallbackManager {
           if (this.inProgress.has(sessionID)) break;
           if (this.isHostRetryDeduped(sessionID, attempt)) break;
           const d = this.decideIntervention(sessionID, true, retryError);
-          if (d === 'fallback') {
+          if (d === 'fallback' || d === 'fallback-with-terminal-alternative') {
             // Failover may have been detected from status.message (e.g.
             // 'AI_APICallError: Gone') with no separate error property;
             // forward that message so 401/410 inline errors suppress the
             // toast on this path too, matching session.error behavior.
-            await this.tryFallbackWithAbort(sessionID, retryError);
+            await this.tryFallbackWithAbort(
+              sessionID,
+              retryError,
+              d === 'fallback-with-terminal-alternative',
+            );
           }
           // absorb/fallback-delayed → no-op
           break;
@@ -1295,7 +1302,11 @@ export class ForegroundFallbackManager {
     sessionID: string,
     needsAbort = false,
     error?: unknown,
-  ): 'absorb' | 'fallback' | 'fallback-delayed' {
+  ):
+    | 'absorb'
+    | 'fallback'
+    | 'fallback-delayed'
+    | 'fallback-with-terminal-alternative' {
     const permanentUsageQuota = isPermanentUsageQuotaError(error);
     if (!permanentUsageQuota && !this.consumeRetryBudget(sessionID)) {
       return 'absorb';
@@ -1304,11 +1315,23 @@ export class ForegroundFallbackManager {
       const pendingDelay = this.pendingInitialDelay.get(sessionID);
       if (pendingDelay) {
         if (needsAbort && pendingDelay.hasTerminalFallback) {
-          // Keep the terminal replay alternative until the fixed deadline.
-          // The child guard is evaluated then, against the latest live state.
-          pendingDelay.latestNeedsAbort = true;
           pendingDelay.latestError = error;
-          return 'fallback-delayed';
+          if (this.withholdsAbortForLiveChildren(sessionID)) {
+            // Keep the original deadline and terminal replay alternative while
+            // a child is live. The timer checks child state again at fire time.
+            pendingDelay.latestNeedsAbort = true;
+            return 'fallback-delayed';
+          }
+          // No live child at retry arrival: promote the retry immediately, but
+          // retain the terminal replay alternative in case one appears while
+          // foreground-waiter promotion is in flight.
+          clearTimeout(pendingDelay.handle);
+          this.pendingInitialDelay.delete(sessionID);
+          log('[foreground-fallback] permanent usage/quota failure', {
+            sessionID,
+            needsAbort,
+          });
+          return 'fallback-with-terminal-alternative';
         }
         clearTimeout(pendingDelay.handle);
         this.pendingInitialDelay.delete(sessionID);

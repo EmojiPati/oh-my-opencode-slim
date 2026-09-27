@@ -2729,6 +2729,72 @@ describe('ForegroundFallbackManager v1 abort protection for live children', () =
     }
   });
 
+  test('T3a: permanent retry without live children cancels the delay and aborts immediately', async () => {
+    jest.useFakeTimers();
+    try {
+      const calls: string[] = [];
+      const { mocks } = createMockClient({
+        postImpl: async () => {
+          calls.push('promote');
+          return {};
+        },
+        abortImpl: async () => {
+          calls.push('abort');
+          return {};
+        },
+        promptAsyncImpl: async () => {
+          calls.push('prompt');
+          return {};
+        },
+      });
+      const mgr = new ForegroundFallbackManager(
+        makeChains(),
+        true,
+        { directory: '/test' } as any,
+        0,
+        undefined,
+        undefined,
+        100,
+        0,
+        undefined,
+        undefined,
+        observe,
+      );
+      const sessionID = 'sess-permanent-no-child';
+      await seed(mgr, sessionID);
+      await mgr.handleEvent(error(sessionID));
+      expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+      jest.advanceTimersByTime(40);
+      await mgr.handleEvent({
+        type: 'session.status',
+        properties: {
+          sessionID,
+          error: { message: 'Monthly usage limit reached' },
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Monthly usage limit reached',
+          },
+        },
+      });
+
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(calls).toEqual(['abort', 'prompt']);
+      expect((mgr as any).pendingInitialDelay.size).toBe(0);
+
+      jest.advanceTimersByTime(100);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(mocks.abort).toHaveBeenCalledTimes(1);
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(calls).toEqual(['abort', 'prompt']);
+    } finally {
+      live.clear();
+      jest.useRealTimers();
+    }
+  });
+
   test('T3c: children gone at the deadline allow the latest retry to abort', async () => {
     jest.useFakeTimers();
     try {
@@ -2873,6 +2939,9 @@ describe('ForegroundFallbackManager v1 abort protection for live children', () =
           },
         },
       });
+      expect(mocks.abort).not.toHaveBeenCalled();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(calls).toEqual(['promote', 'prompt']);
       jest.advanceTimersByTime(60);
       for (let i = 0; i < 30; i++) await Promise.resolve();
 
