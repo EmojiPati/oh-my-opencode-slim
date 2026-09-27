@@ -2662,6 +2662,73 @@ describe('ForegroundFallbackManager v1 abort protection for live children', () =
     expect(mocks.abort).toHaveBeenCalledTimes(0);
   });
 
+  test('T3b: permanent retry preserves a pending child-safe replay deadline', async () => {
+    jest.useFakeTimers();
+    try {
+      const { mocks } = createMockClient();
+      const calls = { prepare: 0, admit: 0 };
+      const mgr = new ForegroundFallbackManager(
+        makeChains(),
+        true,
+        { directory: '/test' } as any,
+        0,
+        undefined,
+        undefined,
+        100,
+        0,
+        {
+          prepare: () => {
+            calls.prepare += 1;
+            return true;
+          },
+          admit: () => {
+            calls.admit += 1;
+          },
+          reject: () => {},
+          settleUnresolved: () => {},
+        },
+        undefined,
+        observe,
+      );
+      const sessionID = 'sess-delayed-live-child';
+      live.add(sessionID);
+      await seed(mgr, sessionID);
+      await mgr.handleEvent(error(sessionID));
+      expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+      jest.advanceTimersByTime(40);
+      await mgr.handleEvent({
+        type: 'session.status',
+        properties: {
+          sessionID,
+          error: { message: 'Monthly usage limit reached' },
+          status: {
+            type: 'retry',
+            attempt: 1,
+            message: 'Monthly usage limit reached',
+          },
+        },
+      });
+      expect(mocks.promptAsync).not.toHaveBeenCalled();
+      expect(mocks.abort).not.toHaveBeenCalled();
+      expect((mgr as any).pendingInitialDelay.size).toBe(1);
+
+      jest.advanceTimersByTime(60);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(mocks.abort).not.toHaveBeenCalled();
+      expect(calls).toEqual({ prepare: 1, admit: 1 });
+
+      jest.advanceTimersByTime(100);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+      expect(calls).toEqual({ prepare: 1, admit: 1 });
+    } finally {
+      live.clear();
+      jest.useRealTimers();
+    }
+  });
+
   test('T4: exhausted chain stops intervening without aborting live children', async () => {
     const { mocks } = createMockClient();
     const mgr = manager(undefined, { orchestrator: ['openai/model-y'] });

@@ -1302,6 +1302,17 @@ export class ForegroundFallbackManager {
     if (permanentUsageQuota) {
       const pendingDelay = this.pendingInitialDelay.get(sessionID);
       if (pendingDelay) {
+        if (
+          needsAbort &&
+          !pendingDelay.needsAbort &&
+          this.withholdsAbortForLiveChildren(sessionID)
+        ) {
+          // Keep the terminal replay at its original deadline when the v1
+          // child guard would refuse the retry's abort. Carry the quota error
+          // forward so fallback selection still treats it as permanent.
+          pendingDelay.error = error;
+          return 'fallback-delayed';
+        }
         clearTimeout(pendingDelay.handle);
         this.pendingInitialDelay.delete(sessionID);
       }
@@ -1320,6 +1331,14 @@ export class ForegroundFallbackManager {
         // current: host retries require an abort, terminal errors replay.
         const pending = this.pendingInitialDelay.get(sessionID);
         if (pending) {
+          if (
+            needsAbort &&
+            !pending.needsAbort &&
+            this.withholdsAbortForLiveChildren(sessionID)
+          ) {
+            pending.error = error;
+            return 'fallback-delayed';
+          }
           pending.needsAbort = needsAbort;
           pending.error = error;
         }
