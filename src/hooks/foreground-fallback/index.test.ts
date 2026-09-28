@@ -604,6 +604,66 @@ describe('foreground fallback redo harness', () => {
     expect(showToast).not.toHaveBeenCalled();
   });
 
+  test('permanent billing failure bypasses the configured initial delay', async () => {
+    const { manager, mocks } = makeManager({ initialRetryDelayMs: 1_000 });
+    const sessionID = 'permanent-billing-no-delay';
+    await manager.handleEvent(redoEvents.assistant(sessionID));
+
+    await manager.handleEvent(
+      redoEvents.assistant(sessionID, 'a', {
+        statusCode: 402,
+        message: 'Payment Required',
+      }),
+    );
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  test('initial retry delay is used once per descent before normal retry backoff', async () => {
+    const { manager, mocks } = makeManager({
+      initialRetryDelayMs: 1_000,
+      retryDelayMs: 100,
+    });
+    const sessionID = 'single-initial-delay';
+    await manager.handleEvent(redoEvents.assistant(sessionID));
+    await manager.handleEvent(redoEvents.error(sessionID));
+    jest.advanceTimersByTime(1_000);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+    const secondFailure = manager.handleEvent(
+      redoEvents.assistant(sessionID, 'b', { message: 'rate limit' }),
+    );
+    jest.advanceTimersByTime(99);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    jest.advanceTimersByTime(1);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    await secondFailure;
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'c' } },
+    });
+  });
+
+  test('a new external turn clears prior consecutive-fallback backoff', async () => {
+    const { manager, mocks } = makeManager({ retryDelayMs: 1_000 });
+    const sessionID = 'turn-clears-backoff';
+    await manager.handleEvent(redoEvents.assistant(sessionID));
+    await manager.handleEvent(redoEvents.error(sessionID));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+
+    await manager.handleEvent(redoEvents.user(sessionID, 'new-user'));
+    const nextFailure = manager.handleEvent(
+      redoEvents.error(sessionID, { message: 'rate limit' }, 'new-failure'),
+    );
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    await nextFailure;
+  });
+
   test('a new external turn resets the retry budget before any model switch', async () => {
     const { manager, mocks } = makeManager({ maxRetries: 1 });
     await manager.handleEvent(redoEvents.assistant('early-turn-reset'));

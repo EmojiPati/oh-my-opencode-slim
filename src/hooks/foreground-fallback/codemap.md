@@ -54,6 +54,9 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
 - A retry arriving while a fallback is in progress is not admitted and does not
   consume retry budget; delayed fallback retains the triggering error for
   consistent inline-error toast suppression.
+- Confirmed permanent quota/billing failures bypass the initial fallback delay.
+  The delay is consumed once per descent; later links use only consecutive
+  fallback backoff, and a confirmed new external turn clears that backoff.
 
 ### State Management
 - **Deduplication**: the short duplicate-observation window is scoped by the

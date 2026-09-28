@@ -285,6 +285,41 @@ export function isFailoverError(error: unknown): boolean {
 }
 
 const INLINE_STATUS_CODES = new Set([401, 410]);
+const PERMANENT_QUOTA_BILLING_PATTERNS = [
+  /\bpersonal-team-blocked\b/i,
+  /\bspending.?limit\b/i,
+  /\b(?:ran|run) out of credits\b/i,
+  /\bcoding plan package has expired\b/i,
+  /\b(?:weekly|monthly) limit exhausted\b/i,
+  /\b(?:1113|1308|1309|1310)\b/,
+];
+
+/** Permanent payment/quota exhaustion cannot recover by waiting on this model. */
+export function isPermanentQuotaBillingError(error: unknown): boolean {
+  if (extractStatusCode(error) === 402) return true;
+  const text =
+    typeof error === 'string'
+      ? error
+      : isRecord(error)
+        ? [
+            error.code,
+            error.message,
+            nestedField(error.data, 'code'),
+            nestedField(error.data, 'message'),
+            nestedField(error.data, 'responseBody'),
+            nestedField(error.cause, 'code'),
+            nestedField(error.cause, 'message'),
+            error.responseBody,
+          ]
+            .filter(
+              (value): value is string | number =>
+                typeof value === 'string' || typeof value === 'number',
+            )
+            .map(String)
+            .join(' ')
+        : '';
+  return PERMANENT_QUOTA_BILLING_PATTERNS.some((pattern) => pattern.test(text));
+}
 
 /**
  * True when the error is the kind the runtime surfaces inline (401 auth,
@@ -438,6 +473,9 @@ export class ForegroundFallbackManager {
       incidentID?: string;
     }
   >();
+  /** True after the first initial delay or immediate permanent intervention
+   *  has started in the current fallback descent. */
+  private readonly initialDelayUsed = new Set<string>();
   /** sessionID -> timestamp of last fallback attempt.
    *  Used to enforce retryDelayMs between consecutive attempts. */
   private readonly lastFallbackTime = new Map<string, number>();
@@ -581,6 +619,8 @@ export class ForegroundFallbackManager {
     this.lastTriggerTurn.delete(sessionID);
     this.triggerIncidents.delete(sessionID);
     this.pendingErrorCorrelation.delete(sessionID);
+    this.lastFallbackTime.delete(sessionID);
+    this.initialDelayUsed.delete(sessionID);
     this.sessionRetries.delete(sessionID);
     this.retryAttempt.delete(sessionID);
     this.cancelInitialDelay(sessionID);
@@ -837,6 +877,7 @@ export class ForegroundFallbackManager {
         this.sessionRetries.delete(id);
         this.chainExhaustion.delete(id);
         this.lastFallbackTime.delete(id);
+        this.initialDelayUsed.delete(id);
         // Cancel any pending initial delay
         this.cancelInitialDelay(id);
       });
@@ -923,7 +964,9 @@ export class ForegroundFallbackManager {
             typeof info.id === 'string' ? info.id : undefined,
             info.error,
           );
-          if (
+          if (this.bypassInitialFallbackDelay(sessionID, info.error)) {
+            await this.tryFallback(sessionID, info.error, incidentID);
+          } else if (
             !this.delayInitialFallback(
               sessionID,
               false,
@@ -940,6 +983,7 @@ export class ForegroundFallbackManager {
           this.retryAttempt.delete(sessionID);
           this.chainExhaustion.delete(sessionID);
           this.lastFallbackTime.delete(sessionID);
+          this.initialDelayUsed.delete(sessionID);
           // A success also ends any failure streak, so the models the
           // streak marked tried are no longer proven dead. Static-chain
           // agents already get this from the re-arm reset (a new turn
@@ -988,7 +1032,9 @@ export class ForegroundFallbackManager {
           typeof props.info?.id === 'string' ? props.info.id : undefined,
           props.error,
         );
-        if (
+        if (this.bypassInitialFallbackDelay(sessionID, props.error)) {
+          await this.tryFallback(sessionID, props.error, incidentID);
+        } else if (
           !this.delayInitialFallback(
             sessionID,
             false,
@@ -1058,7 +1104,14 @@ export class ForegroundFallbackManager {
           const retryError = props.error ?? {
             message: props.status?.message ?? '',
           };
-          if (
+          if (this.bypassInitialFallbackDelay(sessionID, retryError)) {
+            await this.tryFallbackWithAbort(
+              sessionID,
+              retryError,
+              attempt,
+              incidentID,
+            );
+          } else if (
             !this.delayInitialFallback(
               sessionID,
               true,
@@ -1257,6 +1310,16 @@ export class ForegroundFallbackManager {
     this.pendingInitialDelay.delete(sessionID);
   }
 
+  private bypassInitialFallbackDelay(
+    sessionID: string,
+    error: unknown,
+  ): boolean {
+    if (!isPermanentQuotaBillingError(error)) return false;
+    this.cancelInitialDelay(sessionID);
+    this.initialDelayUsed.add(sessionID);
+    return true;
+  }
+
   /** Defer an intervention when configured, regardless of its trigger path. */
   private delayInitialFallback(
     sessionID: string,
@@ -1265,7 +1328,7 @@ export class ForegroundFallbackManager {
     error?: unknown,
     incidentID?: string,
   ): boolean {
-    if (this.initialRetryDelayMs > 0) {
+    if (this.initialRetryDelayMs > 0 && !this.initialDelayUsed.has(sessionID)) {
       log('[foreground-fallback] delaying initial fallback', {
         sessionID,
         delayMs: this.initialRetryDelayMs,
@@ -1286,6 +1349,7 @@ export class ForegroundFallbackManager {
         if (!latest) return;
         this.pendingInitialDelay.delete(sessionID);
         if (!this.isCurrentTurn(sessionID, latest.turn)) return;
+        this.initialDelayUsed.add(sessionID);
         // Background fallback is fail-soft: a failure must be logged
         // and swallowed, never escape as an unhandled rejection.
         // Call tryFallbackWithAbort for session.status retry path
@@ -1521,6 +1585,7 @@ export class ForegroundFallbackManager {
     this.sessionRetries.delete(sessionID);
     this.chainExhaustion.delete(sessionID);
     this.retryAttempt.delete(sessionID);
+    this.initialDelayUsed.delete(sessionID);
   }
 
   private selectFallbackModel(sessionID: string) {
