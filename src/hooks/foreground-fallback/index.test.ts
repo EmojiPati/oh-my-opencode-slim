@@ -272,6 +272,34 @@ describe('foreground fallback redo harness', () => {
     expect(mocks.abort).not.toHaveBeenCalled();
   });
 
+  test('uncorrelated session.error is correlated with its matching errored message update', async () => {
+    const { manager, mocks } = makeManager();
+    const error = {
+      data: { statusCode: 429 },
+      message: 'provider quota exhausted for request 17',
+    };
+    await manager.handleEvent(redoEvents.assistant('error-correlation'));
+    await manager.handleEvent({
+      type: 'session.error',
+      properties: { sessionID: 'error-correlation', error },
+    });
+    await manager.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'failed-assistant-message',
+          sessionID: 'error-correlation',
+          role: 'assistant',
+          providerID: 'test',
+          modelID: 'a',
+          error,
+        },
+      },
+    });
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
+
   test('a separate user turn is not suppressed by failure deduplication', async () => {
     const { manager, mocks } = makeManager({ maxRetries: 0 });
     await manager.handleEvent(redoEvents.assistant('turn-dedup'));
@@ -468,6 +496,80 @@ describe('foreground fallback redo harness', () => {
       body: { model: { providerID: 'test', modelID: 'c' } },
     });
     expect(onChanged).toHaveBeenCalledWith('turn-probe-order', 'test/c');
+  });
+
+  test('an internal replay notification does not invalidate an external turn probe', async () => {
+    const externalProbe = deferred<unknown>();
+    const promptStarted = deferred<void>();
+    const promptResponse = deferred<unknown>();
+    let lookupCount = 0;
+    let manager!: ForegroundFallbackManager;
+    const onChanged = mock((_sessionID: string, _model: string) => {});
+    const { mocks } = createMockClient({
+      messagesImpl: async () => {
+        lookupCount += 1;
+        if (lookupCount === 1) return externalProbe.promise;
+        return {
+          data: [
+            {
+              info: { id: 'fallback-source', role: 'user' },
+              parts: [{ type: 'text', text: 'hello' }],
+            },
+          ],
+        };
+      },
+      promptAsyncImpl: async (args) => {
+        const messageID = (args as { body: { messageID: string } }).body
+          .messageID;
+        await manager.handleEvent({
+          type: 'message.updated',
+          properties: {
+            info: {
+              id: messageID,
+              sessionID: 'internal-does-not-fence',
+              role: 'user',
+            },
+          },
+        });
+        promptStarted.resolve();
+        return promptResponse.promise;
+      },
+    });
+    manager = new ForegroundFallbackManager(
+      { orchestrator: ['test/a', 'test/b'] },
+      true,
+      { directory: '/test' } as never,
+      0,
+      undefined,
+      onChanged,
+    );
+    const sessionID = 'internal-does-not-fence';
+
+    await manager.handleEvent(redoEvents.assistant(sessionID));
+    const externalTurn = manager.handleEvent({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id: 'genuine-external-turn',
+          sessionID,
+          role: 'user',
+          model: { providerID: 'test', modelID: 'b' },
+        },
+      },
+    });
+    const fallback = manager.handleEvent(redoEvents.error(sessionID));
+    await promptStarted.promise;
+    externalProbe.resolve({
+      data: [
+        { info: { id: 'genuine-external-turn', role: 'user' }, parts: [] },
+      ],
+    });
+    await externalTurn;
+    promptResponse.resolve({});
+    await fallback;
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(onChanged).not.toHaveBeenCalled();
   });
 
   test('delayed fallback retains inline 410 context for toast suppression', async () => {

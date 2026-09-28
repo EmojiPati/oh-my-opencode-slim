@@ -22,14 +22,17 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   - `inProgress`: Process-global Set of sessions with active fallback in flight, shared via `globalThis` + `Symbol.for`
   - `lastTrigger` + turn/model/incident identity: coalesces repeated
     observations of the same failure while allowing distinct failures on the
-    same turn and model to advance the chain
+    same turn and model to advance the chain; a one-shot exact error-payload,
+    model, and turn match correlates an unkeyed `session.error` to its
+    subsequent errored `message.updated`
   - `turnEpoch`: fences fallback work suspended across promotion, abort,
     backoff, transcript reads, and busy-session retry from acting on a newer
     external user turn; each replay reserves and registers its host-valid
     `msg...` ID in the v1 prompt body before submission, so info-only
     notifications remain identifiable when parts arrive later
   - `userEventSequence`: orders asynchronous user-message identity probes so
-    an older transcript lookup cannot overwrite newer turn state
+    an older transcript lookup cannot overwrite newer turn state; known
+    internal replay IDs do not advance the sequence
   - `replayMessageIds`: retain exact IDs of internal replay messages; synthetic
     marker checks remain a fallback for delayed part notifications
 

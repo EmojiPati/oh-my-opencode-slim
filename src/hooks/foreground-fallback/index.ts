@@ -398,6 +398,19 @@ export class ForegroundFallbackManager {
     string,
     Map<string, { turn: number; time: number }>
   >();
+  /** One-shot bridge between uncorrelated session.error and its matching
+   *  errored message.updated event. */
+  private readonly pendingErrorCorrelation = new Map<
+    string,
+    {
+      incidentID: string;
+      turn: number;
+      model: string | undefined;
+      fingerprint: string;
+      time: number;
+    }
+  >();
+  private incidentSequence = 0;
   /** Confirmed external user-turn generations fence suspended work. */
   private readonly turnEpoch = new Map<string, number>();
   private readonly lastUserMessageID = new Map<string, string>();
@@ -567,6 +580,7 @@ export class ForegroundFallbackManager {
     this.lastTriggerModel.delete(sessionID);
     this.lastTriggerTurn.delete(sessionID);
     this.triggerIncidents.delete(sessionID);
+    this.pendingErrorCorrelation.delete(sessionID);
     this.sessionRetries.delete(sessionID);
     this.retryAttempt.delete(sessionID);
     this.cancelInitialDelay(sessionID);
@@ -576,6 +590,61 @@ export class ForegroundFallbackManager {
     const next = (this.userEventSequence.get(sessionID) ?? 0) + 1;
     this.userEventSequence.set(sessionID, next);
     return next;
+  }
+
+  private isKnownInternalReplayUserMessage(
+    sessionID: string,
+    messageID: string,
+    parts: unknown[],
+  ): boolean {
+    if (this.replayMessageIds.get(sessionID)?.has(messageID)) return true;
+    const marked = parts.some(
+      (part) =>
+        isInternalInitiatorPart(part) ||
+        (isRecord(part) &&
+          typeof part.text === 'string' &&
+          part.text.includes(SLIM_INTERNAL_INITIATOR_MARKER)),
+    );
+    if (marked) this.rememberReplayMessage(sessionID, messageID);
+    return marked;
+  }
+
+  private incidentForMessageError(
+    sessionID: string,
+    messageID: string | undefined,
+    error: unknown,
+  ): string {
+    const pending = this.pendingErrorCorrelation.get(sessionID);
+    this.pendingErrorCorrelation.delete(sessionID);
+    if (
+      pending &&
+      pending.turn === (this.turnEpoch.get(sessionID) ?? 0) &&
+      pending.model === this.sessionModel.get(sessionID) &&
+      pending.fingerprint === stringifyError(error) &&
+      Date.now() - pending.time < DEDUP_WINDOW_MS
+    ) {
+      return pending.incidentID;
+    }
+    return messageID
+      ? `message:${messageID}`
+      : `message-error:${++this.incidentSequence}`;
+  }
+
+  private incidentForSessionError(
+    sessionID: string,
+    messageID: string | undefined,
+    error: unknown,
+  ): string {
+    if (messageID) return `message:${messageID}`;
+    const incidentID = `session-error:${++this.incidentSequence}`;
+    this.pendingErrorCorrelation.set(sessionID, {
+      incidentID,
+      turn: this.turnEpoch.get(sessionID) ?? 0,
+      model: this.sessionModel.get(sessionID),
+      fingerprint: stringifyError(error),
+      time: Date.now(),
+    });
+    return incidentID;
   }
 
   private isCurrentTurn(sessionID: string, epoch: number): boolean {
@@ -759,6 +828,7 @@ export class ForegroundFallbackManager {
         this.lastTriggerModel.delete(id);
         this.lastTriggerTurn.delete(id);
         this.triggerIncidents.delete(id);
+        this.pendingErrorCorrelation.delete(id);
         this.turnEpoch.set(id, (this.turnEpoch.get(id) ?? 0) + 1);
         this.lastUserMessageID.delete(id);
         this.userEventSequence.delete(id);
@@ -797,7 +867,10 @@ export class ForegroundFallbackManager {
             : Array.isArray(info.parts)
               ? info.parts
               : [];
-          if (typeof info.id === 'string') {
+          if (
+            typeof info.id === 'string' &&
+            !this.isKnownInternalReplayUserMessage(sessionID, info.id, parts)
+          ) {
             const eventSequence = this.nextUserEventSequence(sessionID);
             const isInternal = await this.isInternalReplayUserMessage(
               sessionID,
@@ -845,8 +918,11 @@ export class ForegroundFallbackManager {
           typeof messageTime.completed === 'number';
         // Failover-worthy error on an individual message
         if (info.error && isFailoverError(info.error)) {
-          const incidentID =
-            typeof info.id === 'string' ? `message:${info.id}` : undefined;
+          const incidentID = this.incidentForMessageError(
+            sessionID,
+            typeof info.id === 'string' ? info.id : undefined,
+            info.error,
+          );
           if (
             !this.delayInitialFallback(
               sessionID,
@@ -904,23 +980,24 @@ export class ForegroundFallbackManager {
           | undefined;
         if (!props) break;
         const sessionID = eventSessionID(props);
+        if (!sessionID || !props.error || !isFailoverError(props.error)) {
+          break;
+        }
+        const incidentID = this.incidentForSessionError(
+          sessionID,
+          typeof props.info?.id === 'string' ? props.info.id : undefined,
+          props.error,
+        );
         if (
-          sessionID &&
-          props.error &&
-          isFailoverError(props.error) &&
           !this.delayInitialFallback(
             sessionID,
             false,
             undefined,
             props.error,
-            props.info?.id ? `message:${props.info.id}` : undefined,
+            incidentID,
           )
         ) {
-          await this.tryFallback(
-            sessionID,
-            props.error,
-            props.info?.id ? `message:${props.info.id}` : undefined,
-          );
+          await this.tryFallback(sessionID, props.error, incidentID);
         }
         break;
       }
