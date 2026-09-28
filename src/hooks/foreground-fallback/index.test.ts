@@ -164,11 +164,16 @@ const redoEvents = {
       parts: [{ type: 'text', text: `turn ${id}` }],
     },
   }),
-  assistant: (sessionID: string, modelID = 'a', error?: unknown) => ({
+  assistant: (
+    sessionID: string,
+    modelID = 'a',
+    error?: unknown,
+    messageID = `assistant-${sessionID}-${modelID}`,
+  ) => ({
     type: 'message.updated',
     properties: {
       info: {
-        id: `assistant-${sessionID}`,
+        id: messageID,
         sessionID,
         role: 'assistant',
         agent: 'orchestrator',
@@ -178,9 +183,13 @@ const redoEvents = {
       },
     },
   }),
-  error: (sessionID: string, error: unknown = { message: 'rate limit' }) => ({
+  error: (
+    sessionID: string,
+    error: unknown = { message: 'rate limit' },
+    messageID = `assistant-${sessionID}-a`,
+  ) => ({
     type: 'session.error',
-    properties: { sessionID, error },
+    properties: { sessionID, info: { id: messageID }, error },
   }),
   retry: (sessionID: string, attempt = 1) => ({
     type: 'session.status',
@@ -403,6 +412,96 @@ describe('foreground fallback redo harness', () => {
     expect(onChanged).not.toHaveBeenCalled();
   });
 
+  test('an older transcript probe cannot overwrite a newer external turn', async () => {
+    const olderProbe = deferred<unknown>();
+    let lookupCount = 0;
+    const onChanged = mock((_sessionID: string, _model: string) => {});
+    const { mocks } = createMockClient({
+      messagesImpl: async () => {
+        lookupCount += 1;
+        if (lookupCount === 1) return olderProbe.promise;
+        if (lookupCount === 2) {
+          return {
+            data: [{ info: { id: 'newer-user', role: 'user' }, parts: [] }],
+          };
+        }
+        return {
+          data: [
+            {
+              info: { id: 'replay-source', role: 'user' },
+              parts: [{ type: 'text', text: 'hello' }],
+            },
+          ],
+        };
+      },
+    });
+    const manager = new ForegroundFallbackManager(
+      { orchestrator: ['test/a', 'test/b', 'test/c'] },
+      true,
+      { directory: '/test' } as never,
+      0,
+      undefined,
+      onChanged,
+    );
+    const userEvent = (id: string, modelID: string) => ({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id,
+          sessionID: 'turn-probe-order',
+          role: 'user',
+          model: { providerID: 'test', modelID },
+        },
+      },
+    });
+
+    const oldEvent = manager.handleEvent(userEvent('older-user', 'a'));
+    await manager.handleEvent(userEvent('newer-user', 'b'));
+    olderProbe.resolve({
+      data: [{ info: { id: 'older-user', role: 'user' }, parts: [] }],
+    });
+    await oldEvent;
+
+    await manager.handleEvent(redoEvents.error('turn-probe-order'));
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'c' } },
+    });
+    expect(onChanged).toHaveBeenCalledWith('turn-probe-order', 'test/c');
+  });
+
+  test('delayed fallback retains inline 410 context for toast suppression', async () => {
+    const { mocks } = createMockClient();
+    const showToast = mock(async () => ({}));
+    const manager = new ForegroundFallbackManager(
+      makeChains(),
+      true,
+      {
+        directory: '/test',
+        client: { tui: { showToast } },
+      } as never,
+      0,
+      undefined,
+      undefined,
+      100,
+      0,
+    );
+    const sessionID = 'delayed-inline-410';
+
+    await manager.handleEvent(redoEvents.assistant(sessionID));
+    await manager.handleEvent(
+      redoEvents.assistant(sessionID, 'a', {
+        data: { statusCode: 410 },
+        message: 'AI_APICallError: Gone',
+      }),
+    );
+    jest.advanceTimersByTime(100);
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
   test('a new external turn resets the retry budget before any model switch', async () => {
     const { manager, mocks } = makeManager({ maxRetries: 1 });
     await manager.handleEvent(redoEvents.assistant('early-turn-reset'));
@@ -416,6 +515,35 @@ describe('foreground fallback redo harness', () => {
 
     await manager.handleEvent(redoEvents.retry('early-turn-reset', 2));
     expect(mocks.abort).toHaveBeenCalledTimes(1);
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('an overlapping retry during fallback does not consume the host retry budget', async () => {
+    const started = deferred<void>();
+    const admission = deferred<unknown>();
+    const { mocks } = createMockClient({
+      promptAsyncImpl: async () => {
+        started.resolve();
+        return admission.promise;
+      },
+    });
+    const manager = new ForegroundFallbackManager(
+      { orchestrator: ['test/a', 'test/b'] },
+      true,
+      { directory: '/test' } as never,
+      1,
+    );
+    const sessionID = 'overlapping-host-retry';
+
+    await manager.handleEvent(redoEvents.assistant(sessionID));
+    const fallback = manager.handleEvent(redoEvents.error(sessionID));
+    await started.promise;
+    await manager.handleEvent(redoEvents.retry(sessionID, 1));
+    admission.resolve({ data: { error: { message: 'not admitted' } } });
+    await fallback;
+
+    await manager.handleEvent(redoEvents.retry(sessionID, 2));
+    expect(mocks.abort).not.toHaveBeenCalled();
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
   });
 
@@ -4962,6 +5090,7 @@ describe('ForegroundFallbackManager deduplication', () => {
       type: 'session.error',
       properties: {
         sessionID: 'sess-dup',
+        info: { id: 'failed-message' },
         error: { message: 'rate limit exceeded' },
       },
     };
@@ -4970,6 +5099,33 @@ describe('ForegroundFallbackManager deduplication', () => {
     await mgr.handleEvent(event); // immediate second trigger - should be deduped
 
     expect(mocks.promptAsync).toHaveBeenCalledTimes(1);
+  });
+
+  test('distinct failure incidents on the same turn and model are not time-deduped', async () => {
+    const { mocks } = createMockClient({
+      promptAsyncImpl: async () => ({
+        data: { error: { message: 'replay admission rejected' } },
+      }),
+    });
+    const mgr = new ForegroundFallbackManager(
+      { orchestrator: ['test/a', 'test/b', 'test/c'] },
+      true,
+      { directory: '/test' } as any,
+    );
+    const errorEvent = (incidentID: string) => ({
+      type: 'session.error',
+      properties: {
+        sessionID: 'same-model-incidents',
+        info: { id: incidentID },
+        error: { message: 'rate limit' },
+      },
+    });
+
+    await mgr.handleEvent(redoEvents.assistant('same-model-incidents'));
+    await mgr.handleEvent(errorEvent('failure-one'));
+    await mgr.handleEvent(errorEvent('failure-two'));
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
   });
 
   test('different sessions are not deduplicated against each other', async () => {

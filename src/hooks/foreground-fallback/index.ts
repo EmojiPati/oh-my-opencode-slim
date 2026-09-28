@@ -393,9 +393,16 @@ export class ForegroundFallbackManager {
   private readonly lastTriggerModel = new Map<string, string>();
   /** Turn identity associated with the last failure dedup marker. */
   private readonly lastTriggerTurn = new Map<string, number>();
+  /** Recent event identities deduplicate only repeated observations of one incident. */
+  private readonly triggerIncidents = new Map<
+    string,
+    Map<string, { turn: number; time: number }>
+  >();
   /** Confirmed external user-turn generations fence suspended work. */
   private readonly turnEpoch = new Map<string, number>();
   private readonly lastUserMessageID = new Map<string, string>();
+  /** Arrival order fences stale asynchronous transcript identity probes. */
+  private readonly userEventSequence = new Map<string, number>();
   private readonly replayMessageIds = new Map<string, Set<string>>();
   /** Last host retry attempt charged for each turn/model episode. */
   private readonly retryAttempt = new Map<
@@ -414,6 +421,8 @@ export class ForegroundFallbackManager {
       needsAbort: boolean;
       turn: number;
       retryAttempt?: number;
+      error?: unknown;
+      incidentID?: string;
     }
   >();
   /** sessionID -> timestamp of last fallback attempt.
@@ -533,6 +542,7 @@ export class ForegroundFallbackManager {
     }
     this.pendingInitialDelay.clear();
     this.replayMessageIds.clear();
+    this.userEventSequence.clear();
   }
 
   /** Dispose fence for fallback chains: true when this generation was
@@ -556,9 +566,16 @@ export class ForegroundFallbackManager {
     this.lastTrigger.delete(sessionID);
     this.lastTriggerModel.delete(sessionID);
     this.lastTriggerTurn.delete(sessionID);
+    this.triggerIncidents.delete(sessionID);
     this.sessionRetries.delete(sessionID);
     this.retryAttempt.delete(sessionID);
     this.cancelInitialDelay(sessionID);
+  }
+
+  private nextUserEventSequence(sessionID: string): number {
+    const next = (this.userEventSequence.get(sessionID) ?? 0) + 1;
+    this.userEventSequence.set(sessionID, next);
+    return next;
   }
 
   private isCurrentTurn(sessionID: string, epoch: number): boolean {
@@ -741,8 +758,10 @@ export class ForegroundFallbackManager {
         this.lastTrigger.delete(id);
         this.lastTriggerModel.delete(id);
         this.lastTriggerTurn.delete(id);
+        this.triggerIncidents.delete(id);
         this.turnEpoch.set(id, (this.turnEpoch.get(id) ?? 0) + 1);
         this.lastUserMessageID.delete(id);
+        this.userEventSequence.delete(id);
         this.replayMessageIds.delete(id);
         this.retryAttempt.delete(id);
         this.sessionRetries.delete(id);
@@ -779,12 +798,16 @@ export class ForegroundFallbackManager {
               ? info.parts
               : [];
           if (typeof info.id === 'string') {
+            const eventSequence = this.nextUserEventSequence(sessionID);
             const isInternal = await this.isInternalReplayUserMessage(
               sessionID,
               info.id,
               parts,
               Array.isArray(props?.parts) || Array.isArray(info.parts),
             );
+            if (this.userEventSequence.get(sessionID) !== eventSequence) {
+              break;
+            }
             if (!isInternal) this.noteExternalTurn(sessionID, info.id);
             if (!isInternal && isRecord(info.model)) {
               const providerID = info.model.providerID;
@@ -822,8 +845,18 @@ export class ForegroundFallbackManager {
           typeof messageTime.completed === 'number';
         // Failover-worthy error on an individual message
         if (info.error && isFailoverError(info.error)) {
-          if (!this.delayInitialFallback(sessionID, false)) {
-            await this.tryFallback(sessionID, info.error);
+          const incidentID =
+            typeof info.id === 'string' ? `message:${info.id}` : undefined;
+          if (
+            !this.delayInitialFallback(
+              sessionID,
+              false,
+              undefined,
+              info.error,
+              incidentID,
+            )
+          ) {
+            await this.tryFallback(sessionID, info.error, incidentID);
           }
         } else if (isCompletedSuccessfulAssistant) {
           // Only a completed, successful assistant response proves recovery.
@@ -875,9 +908,19 @@ export class ForegroundFallbackManager {
           sessionID &&
           props.error &&
           isFailoverError(props.error) &&
-          !this.delayInitialFallback(sessionID, false)
+          !this.delayInitialFallback(
+            sessionID,
+            false,
+            undefined,
+            props.error,
+            props.info?.id ? `message:${props.info.id}` : undefined,
+          )
         ) {
-          await this.tryFallback(sessionID, props.error);
+          await this.tryFallback(
+            sessionID,
+            props.error,
+            props.info?.id ? `message:${props.info.id}` : undefined,
+          );
         }
         break;
       }
@@ -922,6 +965,9 @@ export class ForegroundFallbackManager {
             // retry loop (continuation of previous attempts). Skip it.
             break;
           }
+          // An overlapping retry cannot be admitted by the active fallback;
+          // leave both the retry identity and host budget untouched.
+          if (this.inProgress.has(sessionID)) break;
           this.rearmIfFreshDescent(sessionID);
           if (this.retryAlreadyObserved(sessionID, attempt)) break;
           // Otherwise (attempt === 1, or model didn't change, or outside
@@ -931,15 +977,28 @@ export class ForegroundFallbackManager {
             this.cancelInitialDelay(sessionID);
             break;
           }
-          if (!this.delayInitialFallback(sessionID, true, attempt)) {
+          const incidentID = `retry:${curModel ?? 'unknown'}:${attempt}`;
+          const retryError = props.error ?? {
+            message: props.status?.message ?? '',
+          };
+          if (
+            !this.delayInitialFallback(
+              sessionID,
+              true,
+              attempt,
+              retryError,
+              incidentID,
+            )
+          ) {
             // Failover may have been detected from status.message (e.g.
             // 'AI_APICallError: Gone') with no separate error property;
             // forward that message so 401/410 inline errors suppress the
             // toast on this path too, matching session.error behavior.
             await this.tryFallbackWithAbort(
               sessionID,
-              props.error ?? { message: props.status?.message ?? '' },
+              retryError,
               attempt,
+              incidentID,
             );
           }
           break;
@@ -1126,6 +1185,8 @@ export class ForegroundFallbackManager {
     sessionID: string,
     needsAbort: boolean,
     retryAttempt?: number,
+    error?: unknown,
+    incidentID?: string,
   ): boolean {
     if (this.initialRetryDelayMs > 0) {
       log('[foreground-fallback] delaying initial fallback', {
@@ -1138,6 +1199,8 @@ export class ForegroundFallbackManager {
       if (pending) {
         pending.needsAbort = needsAbort;
         pending.retryAttempt = retryAttempt;
+        pending.error = error;
+        pending.incidentID = incidentID;
         return true;
       }
       const turn = this.turnEpoch.get(sessionID) ?? 0;
@@ -1150,8 +1213,13 @@ export class ForegroundFallbackManager {
         // and swallowed, never escape as an unhandled rejection.
         // Call tryFallbackWithAbort for session.status retry path
         const trigger = latest.needsAbort
-          ? this.tryFallbackWithAbort(sessionID, undefined, latest.retryAttempt)
-          : this.tryFallback(sessionID);
+          ? this.tryFallbackWithAbort(
+              sessionID,
+              latest.error,
+              latest.retryAttempt,
+              latest.incidentID,
+            )
+          : this.tryFallback(sessionID, latest.error, latest.incidentID);
         void trigger.catch((err) => {
           log('[foreground-fallback] delayed fallback trigger failed', {
             sessionID,
@@ -1164,6 +1232,8 @@ export class ForegroundFallbackManager {
         needsAbort,
         turn,
         ...(retryAttempt === undefined ? {} : { retryAttempt }),
+        ...(error === undefined ? {} : { error }),
+        ...(incidentID === undefined ? {} : { incidentID }),
       });
       return true;
     }
@@ -1174,7 +1244,11 @@ export class ForegroundFallbackManager {
   // Core fallback logic
   // ---------------------------------------------------------------------------
 
-  private async tryFallback(sessionID: string, error?: unknown): Promise<void> {
+  private async tryFallback(
+    sessionID: string,
+    error?: unknown,
+    incidentID?: string,
+  ): Promise<void> {
     if (!sessionID) return;
     // Reload fence at entry, before any state mutation: a trigger racing
     // dispose() must not start a new chain through the dead context.
@@ -1187,7 +1261,7 @@ export class ForegroundFallbackManager {
 
     // Deduplicate duplicate observations within the same user turn/model
     // episode. A confirmed new turn or model change starts a new incident.
-    if (this.isDeduped(sessionID)) return;
+    if (this.isDeduped(sessionID, incidentID)) return;
 
     // Set inProgress before delay to prevent concurrent fallback attempts
     this.inProgress.add(sessionID);
@@ -1291,6 +1365,7 @@ export class ForegroundFallbackManager {
     sessionID: string,
     error?: unknown,
     retryAttempt?: number,
+    incidentID?: string,
   ): Promise<void> {
     if (!sessionID) return;
     // Reload fence at entry (same rationale as tryFallback).
@@ -1309,7 +1384,7 @@ export class ForegroundFallbackManager {
       // the meantime — never abort through a stale client.
       if (!this.isCurrentTurn(sessionID, epoch)) return;
       if (this.withholdsAbortForLiveChildren(sessionID)) return;
-      if (this.isDeduped(sessionID)) return;
+      if (this.isDeduped(sessionID, incidentID)) return;
       if (retryAttempt !== undefined) {
         if (this.retryAlreadyObserved(sessionID, retryAttempt)) return;
         this.recordRetryAttempt(sessionID, retryAttempt);
@@ -1326,19 +1401,24 @@ export class ForegroundFallbackManager {
     }
   }
 
-  private isDeduped(sessionID: string): boolean {
+  private isDeduped(sessionID: string, incidentID?: string): boolean {
     const now = Date.now();
     const curModel = this.sessionModel.get(sessionID);
     const turn = this.turnEpoch.get(sessionID) ?? 0;
-    const modelChanged =
-      this.lastTriggerModel.has(sessionID) &&
-      this.lastTriggerModel.get(sessionID) !== curModel;
-    if (
-      !modelChanged &&
-      this.lastTriggerTurn.get(sessionID) === turn &&
-      now - (this.lastTrigger.get(sessionID) ?? 0) < DEDUP_WINDOW_MS
-    )
-      return true;
+    if (incidentID !== undefined) {
+      let incidents = this.triggerIncidents.get(sessionID);
+      if (!incidents) {
+        incidents = new Map();
+        this.triggerIncidents.set(sessionID, incidents);
+      }
+      for (const [id, previous] of incidents) {
+        if (previous.turn !== turn || now - previous.time >= DEDUP_WINDOW_MS) {
+          incidents.delete(id);
+        }
+      }
+      if (incidents.has(incidentID)) return true;
+      incidents.set(incidentID, { turn, time: now });
+    }
     this.lastTrigger.set(sessionID, now);
     this.lastTriggerTurn.set(sessionID, turn);
     if (curModel !== undefined) {

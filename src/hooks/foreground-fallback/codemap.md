@@ -20,14 +20,16 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   - `sessionRetries`: Maps sessionID → absorbed host retry count for the entire descent (not per model)
   - `chainExhaustion`: Maps sessionID → exhaustion stage; stage 2 prevents further aborts without a fresh descent
   - `inProgress`: Process-global Set of sessions with active fallback in flight, shared via `globalThis` + `Symbol.for`
-  - `lastTrigger` + model/turn identity: coalesces duplicate failure observations
-    within one user-turn/model episode; retry-attempt identities prevent a
-    repeated `session.status` attempt from charging the budget twice
+  - `lastTrigger` + turn/model/incident identity: coalesces repeated
+    observations of the same failure while allowing distinct failures on the
+    same turn and model to advance the chain
   - `turnEpoch`: fences fallback work suspended across promotion, abort,
     backoff, transcript reads, and busy-session retry from acting on a newer
     external user turn; each replay reserves and registers its host-valid
     `msg...` ID in the v1 prompt body before submission, so info-only
     notifications remain identifiable when parts arrive later
+  - `userEventSequence`: orders asynchronous user-message identity probes so
+    an older transcript lookup cannot overwrite newer turn state
   - `replayMessageIds`: retain exact IDs of internal replay messages; synthetic
     marker checks remain a fallback for delayed part notifications
 
@@ -46,12 +48,15 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
   - `session.error`: Session-level error event
   - `session.status`: Status message containing rate-limit indicators
 - **Retry budget**: Only a failover-worthy host `session.status` retry (or a v2 retry hook with `decision.retry === true`) charges `fallback.maxRetries`. Each genuine external user turn resets the host retry count, including before any model switch. Terminal `session.error` and errored `message.updated` advance immediately. Exhausting the retry budget keeps it charged across the model chain; successful assistant completion, observed fresh descent from the configured primary, or deletion re-arms it. Stage-2 exhaustion blocks abort on subsequent retry statuses until a fresh descent.
+- A retry arriving while a fallback is in progress is not admitted and does not
+  consume retry budget; delayed fallback retains the triggering error for
+  consistent inline-error toast suppression.
 
 ### State Management
 - **Deduplication**: the short duplicate-observation window is scoped by the
-  confirmed user-turn identity and model episode, so a new turn cannot inherit
-  an earlier failure's cooldown. The window also rejects stale retry events
-  from the previous model. Repeated retry attempt numbers are ignored before
+  confirmed user-turn identity, model episode, and incident ID, so distinct
+  failures on the same model are not merged. The window also rejects stale
+  retry events from the previous model. Repeated retry attempt numbers are ignored before
   the chain-global retry budget is charged. Retry attempts withheld by the live-
   child guard remain eligible when the same attempt is observed after the guard
   clears.
