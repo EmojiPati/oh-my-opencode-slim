@@ -32,12 +32,13 @@ Runtime model fallback system for foreground (interactive) agent sessions. When 
     notifications remain identifiable when parts arrive later
   - `userEventSequence`: orders asynchronous user-message identity probes so
     an older transcript lookup cannot overwrite newer turn state; known
-    internal replay IDs do not advance the sequence
+    internal replay IDs do not advance the sequence; duplicate/stale external
+    user-message updates cannot rewind the current model after a fallback
   - `replayMessageIds`: retain exact IDs of internal replay messages; synthetic
     marker checks remain a fallback for delayed part notifications
 
 ### Fallback Chain Resolution
-- **Agent-specific chains**: Each agent defines an ordered list of fallback models via `_modelArray` entries
+- **Agent-specific chains**: Each agent defines an ordered list of fallback models via `modelArrays`, preserving per-entry variants
 - **Chain lookup**: Resolves the correct chain using:
   1. Agent name (primary) → exact match
   2. Current model (fallback) → search all chains for containing model

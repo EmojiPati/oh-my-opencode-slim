@@ -215,7 +215,7 @@ not an optional-degradation path.
       Copilot initiator-header semantics: for `github-copilot` /
       `github-copilot-enterprise` primary requests whose trailing user
       message is an internal-initiator admission (orchestrator-wake queue
-      prompts, foreground-fallback replays), it sets `x-initiator: agent`
+      prompts), it sets `x-initiator: agent`
       so Copilot's backend does not account plugin-driven turns as user
       activity. The internal marker is learned in-band — prompt `metadata`
       persisted onto the transcript user message (visible on the
@@ -275,9 +275,12 @@ not an optional-degradation path.
       `session.status` + `session.idle`; `failed` → a v1 `session.error`
       with the host error payload before the idle pair), and no
       `session.status`-based fallback remains. The execution-event
-      synthesis keeps orchestrator-wake suppression/arm scheduling and the
-      foreground fallback working on v2 hosts, while the Form and
-      permission bridges above feed the companion's waiting-input
+      synthesis keeps orchestrator-wake suppression/arm scheduling.
+      Automatic foreground fallback remains disabled on v2: the host has no
+      atomic turn-conditional
+      model switch, so a switch started for a failed turn could commit after a
+      newer user turn takes over. The Form and permission bridges above feed
+      the companion's waiting-input
       indicator and the task-session-manager input-wait gate. Form questions
       are observation-only for plugin code on the pinned v2 host: the promise
       plugin context exposes `permission.reply`, but not a supported
@@ -379,7 +382,7 @@ side cannot be observed.
 | Built-in MCPs (context7, gh_grep) auto-registered | ✅ | ✅ `ctx.mcp.transform` | `ctx.mcp.transform` is present in all v2.0.x stable hosts; the runtime capability probe is belt-and-suspenders |
 | webfetch secondary-model summaries | ✅ | ✅ via `ctx.generate.text` | host without `ctx.generate` → summaries unavailable (logged) |
 | Background-job state persistence (tombstones, deletion epochs, alias high-water marks) | ➖ process-local | ✅ via `ctx.storage` | optional domain; absent → pure in-memory fallback, zero behavior change (see [Background job state](#background-job-state-rehydrate-probe-and-persistence)) |
-| Foreground model fallback (rate-limit failover) | ✅ | ✅ shim translates re-prompt into `session.switchModel` + `delivery:"steer"` prompt | — |
+| Foreground model fallback (rate-limit failover) | ✅ | ❌ disabled pending an atomic turn-conditional host switch | v2's non-atomic `session.switchModel` + steer replay could alter/replay a newer turn |
 | `/preset` (preset manager) | ✅ | ✅ TUI plugin entry (`./tui` → `dist/tui2.js`): sidebar (incl. clickable active-preset row) + the same three-level manager as v1 on bare `/preset`, or `/preset <name>` fast path | The layer registers from an `append: "app"` slot render because the host's `keymap.layer` is provider-scoped (calling it from plugin `setup` throws `Keymap.Provider is missing`); the command carries an `id` and `slash.arguments`; host needs `ui.slot` + `keymap.layer`; the manager needs `ui.dialog.select` + `prompt` + `confirm` (without them the sidebar preset row is informational-only, but `/preset <name>` still applies); feedback uses `ui.toast.show`; config-file `preset` still applies at load. Config edits (manual, manager saves, `/preset`) are watched over `.json` + `.jsonc` candidates (user + project, including files/directories created later, arbitrary `OPENCODE_CONFIG_DIR` names, and nested missing ancestors; ~300 ms debounce) and hot-applied **only** as inference profiles: `model`/`variant` via `session.switchModel` and `temperature`/`options` on the captured child session's request options, plus the sidebar's tui-state model entries. Capture is awaited on the `session.prompt` request path (the `session.created` event consumer is only a prewarm) so a first child request cannot race the event pump. Agent definitions, prompts, tools, permissions, skills, and MCPs stay frozen for the session lifetime; the host registry is never reloaded. The TUI **requests** this refresh and reports `Saved … Live refresh requested`; it cannot observe the server-side watcher (separate process, no safe plugin RPC bridge on the supported host), which logs its own failure cause. A malformed config (`invalid-json`/`invalid-schema`/`read-error`) is rejected before any swap — the last-known-good profiles/sidebar stay — and the fix-and-reload fallback applies |
 | Default primary agent | ✅ finalized visible orchestrator identity | ✅ `draft.default(<visible orchestrator identity>)`; the canonical `orchestrator` entry remains a hidden alias when `displayName` is configured | v1 `default_agent` and v2 draft default target the same visible entry |
 | TUI default agent | ✅ orchestrator | ✅ host follows the default primary agent and hoists it to the head of the agent list | — |
@@ -674,15 +677,13 @@ Agent models are resolved the same way as v1 (per-agent `model` in
 v2, set a working provider+model in your config or the plugin's config file
 so delegated subagents can run.
 
-When the foreground model hits a rate limit, the plugin switches the
-session's model (`session.switchModel`) and steers the re-prompt through
-`delivery: "steer"`. A failing `switchModel` call degrades honestly: the
-re-prompt is still delivered (on the current model) and the plugin's logs
-record that no switch happened — the fallback chain is not aborted. On
-hosts without `session.switchModel`, the fallback replay is rejected with
-a clear error instead of silently replaying on the model that just failed
-(other prompt callers, like the orchestrator-wake scheduler, only pin the
-current model and keep steering).
+Automatic foreground fallback is disabled on v2, even when configured. The
+current host API cannot atomically switch a session model only if the failed
+turn is still current; an in-flight non-atomic `session.switchModel` could
+otherwise commit after a newer user turn takes over. Fallback will remain
+disabled until the host provides that turn-conditional operation. Other prompt
+callers, like the orchestrator-wake scheduler, only pin the current model and
+keep steering; this is not foreground fallback.
 
 ## Background job state: rehydrate probe and persistence
 
@@ -909,7 +910,7 @@ How it differs from the v1 path:
   bypass the condition, as on v1.
 - **Wake delivery:** `delivery: "queue"` — v1 `prompt_async` queued, and a
   v2 `steer` would hijack an in-flight run. The shim's `promptAsync` keeps
-  `steer` as the default so the foreground-fallback replay is unchanged.
+  `steer` as the default for callers that request steering.
   The wake model pin carries the session model's variant as the v2-only
   `modelVariant` argument, so `switchModel` preserves the reasoning-effort
   setting instead of resetting it to the host default.
@@ -918,8 +919,8 @@ How it differs from the v1 path:
   read via `session.get` at delivery time) is treated as "continue on this
   model": the shim skips `switchModel` entirely instead of resetting the
   variant to default. This covers every internal caller that pins the
-  current model without a variant opinion (wake pins, task-message,
-  same-model fallback steps) even when the pin's source lost the variant.
+  current model without a variant opinion (wake pins and task-message)
+  even when the pin's source lost the variant.
   Explicit variants (including `default` via `modelVariant`) and
   cross-model pins still switch. Hosts without `session.get`, or a failing
   `get`, keep the legacy variant-free switch.

@@ -610,8 +610,8 @@ export class ForegroundFallbackManager {
     return true;
   }
 
-  private noteExternalTurn(sessionID: string, messageID: string): void {
-    if (this.lastUserMessageID.get(sessionID) === messageID) return;
+  private noteExternalTurn(sessionID: string, messageID: string): boolean {
+    if (this.lastUserMessageID.get(sessionID) === messageID) return false;
     this.lastUserMessageID.set(sessionID, messageID);
     this.turnEpoch.set(sessionID, (this.turnEpoch.get(sessionID) ?? 0) + 1);
     this.lastTrigger.delete(sessionID);
@@ -624,6 +624,7 @@ export class ForegroundFallbackManager {
     this.sessionRetries.delete(sessionID);
     this.retryAttempt.delete(sessionID);
     this.cancelInitialDelay(sessionID);
+    return true;
   }
 
   private nextUserEventSequence(sessionID: string): number {
@@ -922,8 +923,9 @@ export class ForegroundFallbackManager {
             if (this.userEventSequence.get(sessionID) !== eventSequence) {
               break;
             }
-            if (!isInternal) this.noteExternalTurn(sessionID, info.id);
-            if (!isInternal && isRecord(info.model)) {
+            const isNewExternalTurn =
+              !isInternal && this.noteExternalTurn(sessionID, info.id);
+            if (isNewExternalTurn && isRecord(info.model)) {
               const providerID = info.model.providerID;
               const modelID = info.model.modelID ?? info.model.id;
               if (
@@ -933,6 +935,10 @@ export class ForegroundFallbackManager {
                 this.sessionModel.set(sessionID, `${providerID}/${modelID}`);
               }
             }
+            // User-message update events can be re-emitted for an already
+            // observed message after fallback has advanced the session model.
+            // Only a newly confirmed external turn may seed its model.
+            if (!isInternal && !isNewExternalTurn) break;
           }
         }
         // Capture agent name when available (OpenCode includes it on subagent messages)
@@ -941,6 +947,7 @@ export class ForegroundFallbackManager {
         }
         // Track the model currently serving this session
         if (
+          info.role !== 'user' &&
           typeof info.providerID === 'string' &&
           typeof info.modelID === 'string'
         ) {

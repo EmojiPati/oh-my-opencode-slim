@@ -312,6 +312,44 @@ describe('foreground fallback redo harness', () => {
     expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
   });
 
+  test('duplicate host user-message updates cannot rewind fallback descent', async () => {
+    const { manager, mocks } = makeManager({
+      chain: ['test/a', 'test/b', 'test/c'],
+      maxRetries: 0,
+    });
+    const hostUserMessage = (id: string) => ({
+      type: 'message.updated',
+      properties: {
+        info: {
+          id,
+          sessionID: 'stale-user-model',
+          role: 'user',
+          providerID: 'test',
+          modelID: 'a',
+        },
+      },
+    });
+
+    await manager.handleEvent(hostUserMessage('user-turn-1'));
+    await manager.handleEvent(redoEvents.assistant('stale-user-model', 'a'));
+    await manager.handleEvent(redoEvents.error('stale-user-model'));
+    expect(mocks.promptAsync.mock.calls[0]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'b' } },
+    });
+
+    // The host can re-emit the original user message after the fallback
+    // replay. Its original model must not replace the current fallback model.
+    await manager.handleEvent(hostUserMessage('user-turn-1'));
+    await manager.handleEvent(
+      redoEvents.assistant('stale-user-model', 'b', { message: 'rate limit' }),
+    );
+
+    expect(mocks.promptAsync).toHaveBeenCalledTimes(2);
+    expect(mocks.promptAsync.mock.calls[1]?.[0]).toMatchObject({
+      body: { model: { providerID: 'test', modelID: 'c' } },
+    });
+  });
+
   test('v1 info-only replay notification is claimed by its reserved message ID', async () => {
     const transcript: unknown[] = [
       {

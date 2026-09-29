@@ -774,7 +774,7 @@ export const OhMyOpenCodeLite: Plugin = async (ctx) => {
         '[foreground-fallback] automatic fallback disabled on v2 hosts (no atomic per-turn model switch)',
       );
     }
-    foregroundFallbackChains = runtime.runtimeChains;
+    foregroundFallbackChains = runtime.modelArrays;
     foregroundFallback = new ForegroundFallbackManager(
       foregroundFallbackChains,
       fallbackEnabled,

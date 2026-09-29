@@ -3457,6 +3457,80 @@ describe('plugin foreground fallback host gating', () => {
     }
   });
 
+  test('plugin fallback chain forwards configured variants to replay prompts', async () => {
+    await Bun.write(
+      `${projectDir}/oh-my-opencode-slim.json`,
+      JSON.stringify({
+        companion: { enabled: false },
+        fallback: { enabled: true, maxRetries: 0 },
+        agents: {
+          orchestrator: {
+            model: [
+              'openai/gpt-b',
+              { id: 'openai/gpt-c', variant: 'reasoning-high' },
+            ],
+          },
+        },
+      }),
+    );
+    const { client, messages, promptAsync } = createFallbackClient();
+    messages.mockResolvedValue({
+      data: [
+        {
+          info: { id: 'user-variant', role: 'user' },
+          parts: [{ type: 'text', text: 'hello' }],
+        },
+      ],
+    });
+    const hooks = await plugin({
+      client,
+      directory: projectDir,
+      worktree: projectDir,
+      serverUrl: new URL('http://127.0.0.1:4096'),
+    } as never);
+
+    try {
+      await hooks.event?.({
+        event: {
+          type: 'message.updated',
+          properties: {
+            info: {
+              id: 'assistant-variant',
+              sessionID: 'session-variant',
+              role: 'assistant',
+              agent: 'orchestrator',
+              providerID: 'openai',
+              modelID: 'gpt-b',
+            },
+          },
+        },
+      } as never);
+      await hooks.event?.({
+        event: {
+          type: 'session.error',
+          properties: {
+            sessionID: 'session-variant',
+            info: { id: 'assistant-variant' },
+            error: { message: 'rate limit' },
+          },
+        },
+      } as never);
+
+      expect(promptAsync).toHaveBeenCalledTimes(1);
+      expect(promptAsync.mock.calls[0]?.[0]).toMatchObject({
+        body: {
+          model: {
+            providerID: 'openai',
+            modelID: 'gpt-c',
+          },
+          variant: 'reasoning-high',
+        },
+      });
+    } finally {
+      await hooks.dispose?.();
+    }
+  });
+
   test('v2 host with fallback explicitly disabled: no startup notice', async () => {
     await Bun.write(
       `${projectDir}/oh-my-opencode-slim.json`,
